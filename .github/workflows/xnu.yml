@@ -56,6 +56,20 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # OnePlus 3: the arm64 slice of libfirehose_kernel must be ARMv8.0 as well
+          # (Apple clang otherwise targets apple-m1: LSE atomics + LDAPR)
+          python3 - <<'PY'
+          p = 'dxb/build.sh'
+          s = open(p, encoding='utf-8').read()
+          # insert after the last xcconfig sed (before the cd/env/xcodebuild continuation)
+          anchor = "s|$(SDKROOT)/usr/local/include|$(FAKEROOT_DIR)/usr/local/include|g' \"${SRCROOT}/xcodeconfig/libfirehose_kernel.xcconfig\"\n"
+          i = s.index(anchor) + len(anchor)
+          ls = s.rindex('\n', 0, i - 1) + 1
+          indent = s[ls:len(s[:ls]) + (len(s[ls:]) - len(s[ls:].lstrip(' ')))]
+          line = indent + "printf '\\nOTHER_CFLAGS[arch=arm64] = $(inherited) -mcpu=cortex-a57\\n' >> \"${SRCROOT}/xcodeconfig/libfirehose_kernel.xcconfig\"\n"
+          open(p, 'w', encoding='utf-8').write(s[:i] + line + s[i:])
+          PY
+          grep -n 'mcpu=cortex-a57' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
