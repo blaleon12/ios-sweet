@@ -1,0 +1,343 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..7acda17 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1837,16 +1837,22 @@ static void
+ sweet_early_map_final(void)
+ {
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+-	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
++	/* OnePlus 3: framebuffer block + MMIO block at PA 0 (MDP CTL0 kick) */
++	assert(va + 2 * ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = 0x82000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	assert(slot[1] == ARM_TTE_EMPTY);
++	slot[1] = 0x0ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
++	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..002d6e0 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -514,13 +514,17 @@ LEXT(start_first_cpu)
+ 	mov		x21, #0
+ 
+ #if defined(SWEET)
+-	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	/*
++	 * Stage 0: white 64x32 band at the bottom left, no stack or page tables
++	 * needed. OnePlus 3: RGB888 framebuffer at 0x83400000, stride 3240
++	 * (64 px = 48 words); the kick below makes the command-mode panel show it.
++	 */
++	MOV64	x0, (0x83400000 + 1888 * 3240)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	mov		x4, #3240
+ Lsweet_mark_row:
+-	mov		x3, #64
++	mov		x3, #48
+ 	mov		x5, x0
+ Lsweet_mark_pixel:
+ 	str		w1, [x5], #4
+@@ -530,6 +534,14 @@ Lsweet_mark_pixel:
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
+ 	dsb		sy
++	/* MDP CTL0 kick: FLUSH = VIG0|LM0|DSPP0|CTL, then START */
++	MOV64	x0, 0x902018
++	MOV64	x1, 0x22041
++	str		w1, [x0]
++	dsb		sy
++	mov		w1, #1
++	str		w1, [x0, #4]
++	dsb		sy
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -686,13 +698,16 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, 0x82000000		/* OnePlus 3: 32MB block holding the fb at 0x83400000 */
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	/* MMIO block at PA 0 (MDP CTL0 at 0x902000) as Device, for the early kick */
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	str		x11, [x13]
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..7c733a3 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -1,5 +1,5 @@
+ /*
+- * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
++ * Bootstrap console (ios-sweet, ported to the OnePlus 3). No allocation, locks, ADT parsing or
+  * per-CPU state: panic() can reach this before a current thread exists.
+  * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
+  * arm_vm_init installs a reserved kernel VA alias before removing TTBR0;
+@@ -11,11 +11,27 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++/*
++ * OnePlus 3 (MSM8996): LK leaves VIG0 scanning out 0x83400000 (1080x1920,
++ * RGB888, stride 3240) to a command-mode panel. Pixels only reach the panel
++ * after a CTL0 kick (FLUSH = VIG0|LM0|DSPP0|CTL, then START), so every line,
++ * stage mark and panic ends with early_kick(). Before arm_vm_init both the
++ * framebuffer and MDP CTL0 are reached through V=P blocks from start.s,
++ * afterwards through the two kernel VA alias blocks (sweet_early_relocate).
++ */
++#define EARLY_FB_PA      0x83400000ULL
++#define EARLY_FB_BLOCK   0x82000000ULL   /* 32MB block holding the framebuffer */
++#define EARLY_MDP_CTL0   0x902000ULL      /* in the 32MB MMIO block at PA 0 */
++#define EARLY_CTL_FLUSH  (0x18u / 4)
++#define EARLY_CTL_START  (0x1cu / 4)
++#define EARLY_FLUSH_VIG0 0x22041u
++static volatile uint8_t *early_fb = (volatile uint8_t *)(uintptr_t)EARLY_FB_PA;
++static volatile uint32_t *early_mdp = (volatile uint32_t *)(uintptr_t)EARLY_MDP_CTL0;
+ #define EARLY_FB early_fb
++#define EARLY_BPP 3u
+ #define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_HEIGHT 1920u
++#define EARLY_STRIDE 3240u   /* bytes */
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -28,13 +44,32 @@ extern unsigned char iso_font[256 * 16];
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
+ 
++static inline void
++early_px(unsigned int x, unsigned int y, uint32_t argb)
++{
++	volatile uint8_t *p = EARLY_FB + y * EARLY_STRIDE + x * EARLY_BPP;
++	p[0] = (uint8_t)argb;
++	p[1] = (uint8_t)(argb >> 8);
++	p[2] = (uint8_t)(argb >> 16);
++}
++
++static void
++early_kick(void)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	early_mdp[EARLY_CTL_FLUSH] = EARLY_FLUSH_VIG0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	early_mdp[EARLY_CTL_START] = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ static void
+ sweet_early_clear_row(void)
+ {
+ 	for (unsigned int y = 0; y < EARLY_CELL_H; y++) {
+-		volatile uint32_t *line = EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
+-		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
+-			line[x] = 0xff000000u;
++		volatile uint32_t *line = (volatile uint32_t *)(EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE);
++		for (unsigned int x = 0; x < EARLY_WIDTH * EARLY_BPP / 4; x++) {
++			line[x] = 0;   /* black, any byte order */
+ 		}
+ 	}
+ }
+@@ -57,6 +92,7 @@ sweet_early_putc(char c)
+ 		early_col = 0;
+ 		early_row = (early_row + 1) % EARLY_ROWS;
+ 		sweet_early_clear_row();
++		early_kick();
+ 		if (c == '\n') {
+ 			return;
+ 		}
+@@ -64,13 +100,11 @@ sweet_early_putc(char c)
+ 	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
+ 	for (unsigned int gy = 0; gy < 16; gy++) {
+ 		for (unsigned int sy = 0; sy < EARLY_SCALE; sy++) {
+-			volatile uint32_t *line = EARLY_FB +
+-			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
+-			    early_col * EARLY_CELL_W;
++			unsigned int y = early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy;
+ 			for (unsigned int gx = 0; gx < 8; gx++) {
+ 				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
+ 				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
+-					line[gx * EARLY_SCALE + sx] = pixel;
++					early_px(early_col * EARLY_CELL_W + gx * EARLY_SCALE + sx, y, pixel);
+ 				}
+ 			}
+ 		}
+@@ -95,10 +129,10 @@ sweet_early_mark(unsigned int stage, const char *label)
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+ 	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+ 		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+-			EARLY_FB[y * EARLY_STRIDE + x] = color;
++			early_px(x, y, color);
+ 		}
+ 	}
+-	__asm__ volatile("dsb sy" ::: "memory");
++	early_kick();
+ 	sweet_early_string("SWEET EARLY ");
+ 	if (stage >= 10) {
+ 		sweet_early_putc((char)('0' + stage / 10));
+@@ -122,14 +156,17 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	_doprnt(fmt, &copy, sweet_early_putc, 16);
+ 	va_end(copy);
+ 	sweet_early_putc('\n');
+-	__asm__ volatile("dsb sy" ::: "memory");
++	early_kick();
+ }
+ 
+ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	/* base: alias of the framebuffer block; the next 32MB alias is the MMIO
++	 * block at PA 0 (see sweet_early_map_final). */
++	early_fb = (volatile uint8_t *)(uintptr_t)(base + (EARLY_FB_PA - EARLY_FB_BLOCK));
++	early_mdp = (volatile uint32_t *)(uintptr_t)(base + 0x2000000ULL + EARLY_MDP_CTL0);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..f23ad84 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -706,7 +706,11 @@ register_serial_functions(struct pe_serial_functions *fns)
+  * the boot framebuffer described by the ADT node "sweet-fbcon":
+  *   reg    = <phys size>       absolute physical address, not arm-io relative
+  *   width, height              pixels
+- *   stride                     bytes per line, 32bpp
++ *   stride                     bytes per line
++ *   depth (optional)           bytes per pixel, 4 (default) or 3 (RGB888)
++ *   kick-reg (optional)        <phys size> of the MDP CTL block of a
++ *                              command-mode panel; after every line FLUSH
++ *                              (+0x18) = kick-flush, then START (+0x1c) = 1
+  * Lines wrap back to the top instead of scrolling; the line after the cursor
+  * is kept blank so the newest output is easy to find.
+  */
+@@ -717,17 +721,43 @@ extern unsigned char iso_font[256 * 16];
+ #define FBCON_FG        0xffffffffu
+ #define FBCON_BG        0xff000000u
+ 
+-static volatile uint32_t *fbcon_base;
+-static uint32_t fbcon_width, fbcon_height, fbcon_stride;
++static volatile uint8_t *fbcon_base;
++static volatile uint32_t *fbcon_kick_regs;
++static uint32_t fbcon_width, fbcon_height, fbcon_stride, fbcon_depth = 4, fbcon_kick_flush;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
++static inline void
++fbcon_px(uint32_t x, uint32_t y, uint32_t argb)
++{
++	volatile uint8_t *p = fbcon_base + y * fbcon_stride + x * fbcon_depth;
++	if (fbcon_depth == 4) {
++		*(volatile uint32_t *)p = argb;
++	} else {
++		p[0] = (uint8_t)argb;
++		p[1] = (uint8_t)(argb >> 8);
++		p[2] = (uint8_t)(argb >> 16);
++	}
++}
++
++static void
++fbcon_kick(void)
++{
++	if (fbcon_kick_regs == NULL) {
++		return;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	fbcon_kick_regs[0x18 / 4] = fbcon_kick_flush;
++	__asm__ volatile("dsb sy" ::: "memory");
++	fbcon_kick_regs[0x1c / 4] = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ static void
+ fbcon_clear_row(uint32_t row)
+ {
+ 	for (uint32_t y = row * 16 * FBCON_SCALE; y < (row + 1) * 16 * FBCON_SCALE; y++) {
+-		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
+ 		for (uint32_t x = 0; x < fbcon_width; x++) {
+-			line[x] = FBCON_BG;
++			fbcon_px(x, y, FBCON_BG);
+ 		}
+ 	}
+ }
+@@ -739,6 +769,7 @@ fbcon_newline(void)
+ 	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+ 	fbcon_clear_row(fbcon_row);
+ 	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++	fbcon_kick();
+ }
+ 
+ static void
+@@ -750,6 +781,7 @@ fbcon_init(void)
+ 	for (uint32_t r = 0; r < fbcon_rows; r++) {
+ 		fbcon_clear_row(r);
+ 	}
++	fbcon_kick();
+ }
+ 
+ static unsigned int
+@@ -776,11 +808,11 @@ fbcon_transmit_data(uint8_t c)
+ 	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
+ 	for (uint32_t gy = 0; gy < 16; gy++) {
+ 		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
+-			volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
++			uint32_t y = y0 + gy * FBCON_SCALE + sy;
+ 			for (uint32_t gx = 0; gx < 8; gx++) {
+ 				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
+ 				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
+-					line[gx * FBCON_SCALE + sx] = px;
++					fbcon_px(x0 + gx * FBCON_SCALE + sx, y, px);
+ 				}
+ 			}
+ 		}
+@@ -831,11 +863,22 @@ fbcon_probe(void)
+ 	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
+ 		fbcon_stride = *val;
+ 	}
+-	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
++	if (SecureDTGetProperty(entry, "depth", (void const **)&val, &size) == kSuccess) {
++		fbcon_depth = *val;
++	}
++	if ((fbcon_depth != 3 && fbcon_depth != 4) ||
++	    !fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * fbcon_depth) {
+ 		return;
+ 	}
++	uint64_t const *kick;
++	if (SecureDTGetProperty(entry, "kick-reg", (void const **)&kick, &size) == kSuccess && size >= 16) {
++		if (SecureDTGetProperty(entry, "kick-flush", (void const **)&val, &size) == kSuccess) {
++			fbcon_kick_flush = *val;
++		}
++		fbcon_kick_regs = (volatile uint32_t *)ml_io_map(kick[0], kick[1]);
++	}
+ 	sweet_early_mark(17, "fbcon config read; mapping");
+-	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	fbcon_base = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);
+ 	sweet_early_mark(18, "fbcon mapping returned");
+ 	if (fbcon_base != NULL) {
+ 		register_serial_functions(&sweet_fbcon_serial_functions);
