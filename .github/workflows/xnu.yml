@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      runner:
+        description: GitHub runner label (arm64 macOS runners are often out of capacity)
+        default: macos-15-intel
   push:
     branches: [main]
     paths:
@@ -36,7 +39,9 @@ jobs:
   build:
     # macos-14 runners are gone (2026); macos-15 ships Xcode 16, whose iig needs
     # IORPC.kernelContent: added to xnu-8796 by patch 0084
-    runs-on: macos-15
+    # The kernel target is ARM64 either way (build.sh ARCH_CONFIG); an Intel
+    # host just cross-compiles. arm64 runners frequently time out in the queue.
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
