@@ -1,0 +1,96 @@
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index b082a10..e9f7324 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -487,6 +487,16 @@ cpu_idle(void)
+ 	cpu_data_t     *cpu_data_ptr = getCpuDatap();
+ 	uint64_t        new_idle_timeout_ticks = 0x0ULL, lastPop;
+ 	bool idle_disallowed = false;
++#if defined(SWEET)
++	{
++		/* OP3 bring-up: idle entries, vtimer control, highest pending G1 IRQ */
++		extern void sweet_fbcon_status(unsigned int, char, uint32_t);
++		static uint32_t sweet_idle_entries;
++		sweet_fbcon_status(1, 'I', ++sweet_idle_entries);
++		sweet_fbcon_status(2, 'C', (uint32_t)__builtin_arm_rsr64("S3_3_C14_C3_1"));   /* CNTV_CTL_EL0 */
++		sweet_fbcon_status(3, 'P', (uint32_t)__builtin_arm_rsr64("S3_0_C12_C12_2"));  /* ICC_HPPIR1_EL1 */
++	}
++#endif
+ 
+ 	if (__improbable((!idle_enable))) {
+ 		idle_disallowed = true;
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..73f5515 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1868,6 +1868,12 @@ sleh_irq(arm_saved_state_t *state)
+ 		return; /* spurious */
+ 	}
+ 	if (intid == sweet_vtimer_intid) {
++		{
++			/* OP3 bring-up: timer interrupt counter, top right "T:" */
++			extern void sweet_fbcon_status(unsigned int, char, uint32_t);
++			static uint32_t sweet_timer_irqs;
++			sweet_fbcon_status(0, 'T', ++sweet_timer_irqs);
++		}
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index a733416..2a2b01b 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -784,6 +784,53 @@ fbcon_kick(void)
+ 	}
+ }
+ 
++/*
++ * OP3 bring-up status line: slot n shows "<tag>:XXXXXXXX" at the top right,
++ * drawn straight into the framebuffer (no console state, no locks), so it
++ * can be called from the timer interrupt and the idle loop. Kicks only when
++ * the link is idle and never waits.
++ */
++void sweet_fbcon_status(unsigned int slot, char tag, uint32_t value);
++
++static void
++fbcon_glyph_at(uint32_t x0, uint32_t y0, unsigned char c)
++{
++	const unsigned char *glyph = iso_font + c * 16;
++	for (uint32_t gy = 0; gy < 16; gy++) {
++		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
++			for (uint32_t gx = 0; gx < 8; gx++) {
++				uint32_t px = (glyph[gy] & (1u << gx)) ? 0xff00ffffu : FBCON_BG;
++				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
++					fbcon_px(x0 + gx * FBCON_SCALE + sx, y0 + gy * FBCON_SCALE + sy, px);
++				}
++			}
++		}
++	}
++}
++
++void
++sweet_fbcon_status(unsigned int slot, char tag, uint32_t value)
++{
++	const uint32_t cw = 8 * FBCON_SCALE, chars = 11;   /* "T:XXXXXXXX " */
++	if (fbcon_base == NULL || (slot + 1) * chars * cw > fbcon_width) {
++		return;
++	}
++	uint32_t x = fbcon_width - (slot + 1) * chars * cw;
++	fbcon_glyph_at(x, 0, (unsigned char)tag);
++	fbcon_glyph_at(x + cw, 0, ':');
++	for (int i = 0; i < 8; i++) {
++		unsigned d = (value >> (28 - 4 * i)) & 0xf;
++		fbcon_glyph_at(x + (2 + i) * cw, 0, (unsigned char)(d < 10 ? '0' + d : 'A' + d - 10));
++	}
++	if (fbcon_kick_regs != NULL && (fbcon_busy_reg == NULL || !(*fbcon_busy_reg & fbcon_busy_mask))) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		fbcon_kick_regs[0x18 / 4] = fbcon_kick_flush;
++		__asm__ volatile("dsb sy" ::: "memory");
++		fbcon_kick_regs[0x1c / 4] = 1;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
+ static void
+ fbcon_clear_row(uint32_t row)
+ {
