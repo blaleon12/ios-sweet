@@ -1,0 +1,57 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index f55dc05..4863a91 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1854,7 +1854,7 @@ sweet_early_map_final(void)
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	/* make the new blocks visible to the walker; drop any cached walks */
+-	__asm__ volatile("dsb ish; tlbi vmalle1; dsb ish; isb" ::: "memory");
++	__asm__ volatile("dsb ish\n\ttlbi vmalle1\n\tdsb ish\n\tisb" ::: "memory");
+ }
+ #endif
+ 
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index ad2e78a..cf23587 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -69,7 +69,7 @@ static inline uint64_t
+ early_ticks(void)
+ {
+ 	uint64_t t;
+-	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t) :: "memory");
++	__asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(t) :: "memory");
+ 	return t;
+ }
+ 
+@@ -207,7 +207,7 @@ static uint64_t
+ early_at(uint64_t va)
+ {
+ 	uint64_t par;
+-	__asm__ volatile("at s1e1r, %1; isb; mrs %0, par_el1" : "=r"(par) : "r"(va) : "memory");
++	__asm__ volatile("at s1e1r, %1\n\tisb\n\tmrs %0, par_el1" : "=r"(par) : "r"(va) : "memory");
+ 	return par;
+ }
+ 
+@@ -222,7 +222,7 @@ sweet_early_relocate(uint64_t base)
+ 	/* Check both aliases while the V=P console still works (OP3 bring-up). */
+ 	uint64_t par_fb = early_at(fb_va), par_mdp = early_at(mdp_va);
+ 	uint64_t ttbr1, tcr;
+-	__asm__ volatile("mrs %0, ttbr1_el1; mrs %1, tcr_el1" : "=r"(ttbr1), "=r"(tcr));
++	__asm__ volatile("mrs %0, ttbr1_el1\n\tmrs %1, tcr_el1" : "=r"(ttbr1), "=r"(tcr));
+ 	early_hex("FBVA ", fb_va);
+ 	early_hex("PAR ", par_fb);
+ 	sweet_early_putc('\n');
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 75cbd75..a733416 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -752,7 +752,7 @@ static inline uint64_t
+ fbcon_ticks(void)
+ {
+ 	uint64_t t;
+-	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t) :: "memory");
++	__asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(t) :: "memory");
+ 	return t;
+ }
+ 
