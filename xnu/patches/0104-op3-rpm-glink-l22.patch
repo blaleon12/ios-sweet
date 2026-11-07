@@ -1,0 +1,513 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1ce40f3..51504fe 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/op3_input.c			standard
++bsd/dev/op3_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/op3_input.c b/bsd/dev/op3_input.c
+index 4d368bf..bb56cf8 100644
+--- a/bsd/dev/op3_input.c
++++ b/bsd/dev/op3_input.c
+@@ -13,11 +13,12 @@
+  *           volume up / down = PM8994 GPIO 3 / 2 (SID 0, 0xc200 / 0xc100),
+  *           low active
+  * PMIC access goes through the SPMI PMIC arbiter v2 observer channels
+- * (read only). The single PMIC write (L22 enable) needs op3touch=2.
++ * (read only). L22 is switched on by an RPM request (op3_rpm.c, op3touch=2);
++ * never by SPMI: that channel belongs to the RPM (access violation -> reset).
+  *
+  * On by default only with LK's 1080x1920 RGB888 boot framebuffer (OnePlus 3).
+- * Boot-args: op3keys=0 / op3touch=0 disable, op3touch=2 also enables L22 if
+- * it is off, op3i2chz=N bus speed (default 100000), op3touchlog=N logs the
++ * Boot-args: op3keys=0 / op3touch=0 disable, op3touch=2 also asks the RPM to
++ * switch L22 on if it is off, op3i2chz=N bus speed (default 100000), op3touchlog=N logs the
+  * first N touch reports raw.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -33,6 +34,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void op3_input_init(void);
++extern int op3_rpm_ldoa_enable(uint32_t ldo, uint32_t microvolt);
+ 
+ /* ---- MMIO ---- */
+ 
+@@ -42,7 +44,6 @@ void op3_input_init(void);
+ #define OP3_GCC_SIZE     0x00060000u
+ #define OP3_QUP_PA       0x075ba000u
+ #define OP3_ARB_CORE_PA  0x0400f000u
+-#define OP3_ARB_CHNL_PA  0x04400000u
+ #define OP3_ARB_OBS_PA   0x04c00000u
+ 
+ static vm_offset_t op3_tlmm, op3_gcc, op3_qup, op3_core;
+@@ -104,24 +105,22 @@ gpio_in(unsigned n)
+ 
+ #define ARB_CMD         0x00u
+ #define ARB_STATUS      0x08u
+-#define ARB_WDATA0      0x10u
+ #define ARB_RDATA0      0x18u
+-#define ARB_OP_WRITEL   0u
+ #define ARB_OP_READL    1u
+ #define ARB_NO_APID     0xffffu
+ 
+ struct op3_periph {
+ 	uint16_t ppid;          /* sid << 8 | peripheral */
+ 	uint16_t apid;
+-	vm_offset_t obs, chnl;
++	vm_offset_t obs;
+ };
+ 
+ enum { P_PON, P_VOLDN, P_VOLUP, P_L22, P_COUNT };
+ static struct op3_periph op3_pmic[P_COUNT] = {
+-	[P_PON]   = { 0x008, ARB_NO_APID, 0, 0 },
+-	[P_VOLDN] = { 0x0c1, ARB_NO_APID, 0, 0 },
+-	[P_VOLUP] = { 0x0c2, ARB_NO_APID, 0, 0 },
+-	[P_L22]   = { 0x155, ARB_NO_APID, 0, 0 },
++	[P_PON]   = { 0x008, ARB_NO_APID, 0 },
++	[P_VOLDN] = { 0x0c1, ARB_NO_APID, 0 },
++	[P_VOLUP] = { 0x0c2, ARB_NO_APID, 0 },
++	[P_L22]   = { 0x155, ARB_NO_APID, 0 },
+ };
+ static uint32_t op3_arb_status;
+ 
+@@ -155,18 +154,6 @@ pmic_read(int p, uint8_t off, uint8_t *val)
+ 	return true;
+ }
+ 
+-static bool
+-pmic_write(int p, uint8_t off, uint8_t val)
+-{
+-	vm_offset_t ch = op3_pmic[p].chnl;
+-	if (ch == 0) {
+-		return false;
+-	}
+-	wr32(ch, ARB_WDATA0, val);
+-	wr32(ch, ARB_CMD, (ARB_OP_WRITEL << 27) | ((uint32_t)off << 4));
+-	return arb_wait(ch);
+-}
+-
+ static bool
+ pmic_setup(void)
+ {
+@@ -477,13 +464,15 @@ l22_check(void)
+ 	if (!ok || (en & 0x80u) || op3_touch_mode < 2) {
+ 		return;
+ 	}
+-	op3_pmic[P_L22].chnl = ml_io_map(OP3_ARB_CHNL_PA + 0x8000u * op3_pmic[P_L22].apid, 0x1000);
+-	bool w = pmic_write(P_L22, 0x46, 0x80);
++	/*
++	 * NEVER write L22 through SPMI: the channel belongs to the RPM and the
++	 * access violation resets the SoC into crash dump mode (run 0103t2s).
++	 */
++	int r = op3_rpm_ldoa_enable(22, 3000000);
+ 	op3_sleep_ms(5);
+ 	(void)pmic_read(P_L22, 0x46, &en);
+ 	(void)pmic_read(P_L22, 0x08, &st);
+-	printf("OP3 IN: L22 enable write %s (arb %#x): en %#x status %#x\n",
+-	    w ? "ok" : "FAILED", op3_arb_status, en, st);
++	printf("OP3 IN: L22 via RPM -> %d: en %#x status %#x\n", r, en, st);
+ }
+ 
+ static bool
+diff --git a/bsd/dev/op3_rpm.c b/bsd/dev/op3_rpm.c
+new file mode 100644
+index 0000000..d6e8672
+--- /dev/null
++++ b/bsd/dev/op3_rpm.c
+@@ -0,0 +1,390 @@
++/*
++ * OnePlus 3 (MSM8996): minimal RPM client over GLINK (the RPM message RAM
++ * transport), enough to switch an RPM-owned PMIC regulator on. The touch
++ * screen's 2.8 V supply (PM8994 L22) belongs to the RPM: a direct SPMI write
++ * from the application processor is an access violation that resets the SoC
++ * into the crash dump mode, so the only way is a request to the RPM, as
++ * Linux' qcom_glink_rpm + smd-rpm + qcom_smd-regulator do.
++ *
++ * Message RAM 0x68000/0x6000: a table of contents (magic "grt0") in its last
++ * 256 bytes names the two FIFOs, "ap2r" (we write) and "r2ap" (we read),
++ * each: tail, head, data. Every GLINK command is 8 bytes (cmd, param1,
++ * param2), padded to 8. After a write the RPM is kicked through the APCS IPC
++ * register 0x09820010 bit 0. The RPM link is intentless.
++ *
++ * Everything is polled and runs once, from the input thread (op3_input.c).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int op3_rpm_ldoa_enable(uint32_t ldo, uint32_t microvolt);
++
++#define RPM_MSGRAM_PA   0x00068000u
++#define RPM_MSGRAM_SIZE 0x6000u
++#define RPM_IPC_PA      0x09820000u
++#define RPM_IPC_OFF     0x10u
++#define RPM_IPC_BIT     1u
++
++#define TOC_SIZE        256u
++#define TOC_MAGIC       0x67727430u     /* "grt0" */
++#define FIFO_TX_ID      0x61703272u     /* "ap2r" */
++#define FIFO_RX_ID      0x72326170u     /* "r2ap" */
++
++#define CMD_VERSION         0
++#define CMD_VERSION_ACK     1
++#define CMD_OPEN            2
++#define CMD_CLOSE           3
++#define CMD_OPEN_ACK        4
++#define CMD_INTENT          5
++#define CMD_RX_DONE         6
++#define CMD_RX_INTENT_REQ   7
++#define CMD_RX_INTENT_REQ_ACK 8
++#define CMD_TX_DATA         9
++#define CMD_CLOSE_ACK       11
++#define CMD_TX_DATA_CONT    12
++#define CMD_READ_NOTIF      13
++#define CMD_RX_DONE_W_REUSE 14
++#define CMD_SIGNALS         15
++
++#define RPM_LCID            1u
++#define RPM_CHANNEL         "rpm_requests"
++
++#define RPM_SERVICE_REQ     0x00716572u /* "req" */
++#define RPM_MSG_ERR         0x00727265u /* "err" */
++#define RPM_TYPE_LDOA       0x616f646cu /* "ldoa" */
++#define RPM_KEY_SWEN        0x6e657773u /* "swen" */
++#define RPM_KEY_UV          0x00007675u /* "uv" */
++
++struct fifo {
++	vm_offset_t tail, head, data;
++	uint32_t len;
++};
++
++static vm_offset_t rpm_ram, rpm_ipc;
++static struct fifo rpm_tx, rpm_rx;
++static bool rpm_version_ok, rpm_open_ack, rpm_remote_open, rpm_ready;
++static uint32_t rpm_rcid, rpm_msg_id = 1;
++static int rpm_reply = -1000;           /* status of the last RPM answer */
++
++static inline uint32_t
++r32(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static inline void
++w32(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("dmb osh" ::: "memory");
++	*(volatile uint32_t *)a = v;
++}
++
++static void
++rpm_kick(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	w32(rpm_ipc + RPM_IPC_OFF, RPM_IPC_BIT);
++}
++
++static uint32_t
++rx_avail(void)
++{
++	uint32_t head = r32(rpm_rx.head), tail = r32(rpm_rx.tail);
++	return head >= tail ? head - tail : rpm_rx.len - tail + head;
++}
++
++/* Copy count bytes (multiple of 4) at offset off from the rx tail. */
++static void
++rx_peek(void *buf, uint32_t off, uint32_t count)
++{
++	uint32_t pos = r32(rpm_rx.tail) + off;
++	uint32_t *b = buf;
++	for (uint32_t i = 0; i < count / 4; i++) {
++		pos %= rpm_rx.len;
++		b[i] = r32(rpm_rx.data + pos);
++		pos += 4;
++	}
++}
++
++static void
++rx_advance(uint32_t count)
++{
++	uint32_t tail = r32(rpm_rx.tail) + count;
++	if (tail >= rpm_rx.len) {
++		tail -= rpm_rx.len;
++	}
++	w32(rpm_rx.tail, tail);
++}
++
++static uint32_t
++tx_avail(void)
++{
++	uint32_t head = r32(rpm_tx.head), tail = r32(rpm_tx.tail);
++	return tail <= head ? rpm_tx.len - head + tail : tail - head;
++}
++
++/* Write len bytes (padded to 8) to the tx FIFO and kick the RPM. */
++static bool
++tx_write(const void *msg, uint32_t len)
++{
++	uint32_t padded = (len + 7u) & ~7u;
++	const uint8_t *m = msg;
++	if (tx_avail() <= padded) {
++		printf("OP3 RPM: tx fifo full (avail %u, need %u)\n", tx_avail(), padded);
++		return false;
++	}
++	uint32_t head = r32(rpm_tx.head);
++	for (uint32_t i = 0; i < padded; i += 4) {
++		uint32_t w = 0;
++		for (uint32_t j = 0; j < 4; j++) {
++			if (i + j < len) {
++				w |= (uint32_t)m[i + j] << (8 * j);
++			}
++		}
++		w32(rpm_tx.data + head, w);
++		head += 4;
++		if (head >= rpm_tx.len) {
++			head -= rpm_tx.len;
++		}
++	}
++	w32(rpm_tx.head, head);
++	rpm_kick();
++	return true;
++}
++
++static bool
++send_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint32_t m[2] = { (uint32_t)cmd | (uint32_t)p1 << 16, p2 };
++	return tx_write(m, sizeof(m));
++}
++
++/* RPM answer: service header, then {type, length, payload} messages. */
++static void
++rpm_answer(const uint32_t *p, uint32_t len)
++{
++	if (len < 8 || p[0] != RPM_SERVICE_REQ) {
++		printf("OP3 RPM: odd answer len %u svc %#x\n", len, len >= 4 ? p[0] : 0);
++		rpm_reply = -2;
++		return;
++	}
++	uint32_t total = p[1], off = 8;
++	int status = 0;
++	while (off + 8 <= len && off < 8 + total) {
++		uint32_t type = p[off / 4], mlen = p[off / 4 + 1];
++		if (type == RPM_MSG_ERR) {
++			char err[33];
++			uint32_t n = mlen < 32 ? mlen : 32;
++			for (uint32_t i = 0; i < n && off + 8 + i < len; i++) {
++				err[i] = (char)(p[(off + 8 + i) / 4] >> (8 * ((off + 8 + i) % 4)));
++			}
++			err[n] = 0;
++			printf("OP3 RPM: error answer \"%s\"\n", err);
++			status = -1;
++		} else {
++			printf("OP3 RPM: answer msg type %#x len %u value %#x\n", type, mlen,
++			    off + 12 <= len ? p[off / 4 + 2] : 0);
++		}
++		off += (8 + mlen + 3u) & ~3u;
++	}
++	rpm_reply = status;
++}
++
++/* Handle everything in the rx FIFO. */
++static void
++rx_poll(void)
++{
++	for (int n = 0; n < 64; n++) {
++		uint32_t avail = rx_avail(), m[2];
++		if (avail < 8) {
++			return;
++		}
++		rx_peek(m, 0, 8);
++		uint16_t cmd = (uint16_t)m[0], p1 = (uint16_t)(m[0] >> 16);
++		uint32_t p2 = m[1];
++		switch (cmd) {
++		case CMD_VERSION:
++			printf("OP3 RPM: rx VERSION %u features %#x\n", p1, p2);
++			rx_advance(8);
++			(void)send_cmd(CMD_VERSION_ACK, 1, 0);
++			rpm_version_ok = true;
++			break;
++		case CMD_VERSION_ACK:
++			printf("OP3 RPM: rx VERSION_ACK %u features %#x\n", p1, p2);
++			rx_advance(8);
++			rpm_version_ok = true;
++			break;
++		case CMD_OPEN: {
++			uint32_t extra = (p2 + 7u) & ~7u;
++			if (avail < 8 + extra) {
++				return;
++			}
++			char name[33] = {0};
++			uint32_t nb[8] = {0};
++			rx_peek(nb, 8, extra < 32 ? extra : 32);
++			memcpy(name, nb, 32);
++			printf("OP3 RPM: rx OPEN rcid %u \"%s\"\n", p1, name);
++			rx_advance(8 + extra);
++			if (strcmp(name, RPM_CHANNEL) == 0) {
++				rpm_rcid = p1;
++				rpm_remote_open = true;
++				(void)send_cmd(CMD_OPEN_ACK, p1, 0);
++			}
++			break;
++		}
++		case CMD_OPEN_ACK:
++			printf("OP3 RPM: rx OPEN_ACK lcid %u\n", p1);
++			rx_advance(8);
++			if (p1 == RPM_LCID) {
++				rpm_open_ack = true;
++			}
++			break;
++		case CMD_CLOSE:
++			printf("OP3 RPM: rx CLOSE rcid %u\n", p1);
++			rx_advance(8);
++			(void)send_cmd(CMD_CLOSE_ACK, p1, 0);
++			break;
++		case CMD_TX_DATA:
++		case CMD_TX_DATA_CONT: {
++			uint32_t h[4];
++			if (avail < 16) {
++				return;
++			}
++			rx_peek(h, 0, 16);
++			uint32_t chunk = h[2];
++			uint32_t total = (16 + chunk + 7u) & ~7u;
++			if (chunk > 256 || avail < total) {
++				if (chunk > 256) {
++					printf("OP3 RPM: rx data chunk %u too big, dropped\n", chunk);
++					rx_advance(total <= avail ? total : avail & ~7u);
++				}
++				return;
++			}
++			uint32_t d[64];
++			rx_peek(d, 16, (chunk + 3u) & ~3u);
++			rx_advance(total);
++			rpm_answer(d, chunk);
++			break;
++		}
++		case CMD_READ_NOTIF:
++			rx_advance(8);
++			rpm_kick();
++			break;
++		case CMD_INTENT:
++			rx_advance((8 + 8 * p2 + 7u) & ~7u);
++			break;
++		default:
++			printf("OP3 RPM: rx cmd %u p1 %u p2 %#x skipped\n", cmd, p1, p2);
++			rx_advance(8);
++			break;
++		}
++	}
++}
++
++static bool
++wait_for(bool *flag, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 10 && !*flag; i++) {
++		rx_poll();
++		delay(100);
++	}
++	rx_poll();
++	return *flag;
++}
++
++static bool
++rpm_open(void)
++{
++	rpm_ram = ml_io_map(RPM_MSGRAM_PA, 0x8000);
++	rpm_ipc = ml_io_map(RPM_IPC_PA, 0x1000);
++	if (!rpm_ram || !rpm_ipc) {
++		printf("OP3 RPM: mapping failed\n");
++		return false;
++	}
++	vm_offset_t toc = rpm_ram + RPM_MSGRAM_SIZE - TOC_SIZE;
++	uint32_t magic = r32(toc), count = r32(toc + 4);
++	if (magic != TOC_MAGIC || count > (TOC_SIZE - 8) / 12) {
++		printf("OP3 RPM: bad TOC magic %#x count %u\n", magic, count);
++		return false;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t id = r32(toc + 8 + 12 * i), off = r32(toc + 12 + 12 * i);
++		uint32_t size = r32(toc + 16 + 12 * i);
++		if (off + size > RPM_MSGRAM_SIZE) {
++			continue;
++		}
++		struct fifo *f = id == FIFO_TX_ID ? &rpm_tx : id == FIFO_RX_ID ? &rpm_rx : NULL;
++		if (f != NULL) {
++			f->tail = rpm_ram + off;
++			f->head = rpm_ram + off + 4;
++			f->data = rpm_ram + off + 8;
++			f->len = size;
++		}
++	}
++	if (!rpm_tx.len || !rpm_rx.len) {
++		printf("OP3 RPM: fifos not found\n");
++		return false;
++	}
++	printf("OP3 RPM: tx len %u head %u tail %u, rx len %u head %u tail %u\n",
++	    rpm_tx.len, r32(rpm_tx.head), r32(rpm_tx.tail),
++	    rpm_rx.len, r32(rpm_rx.head), r32(rpm_rx.tail));
++	rx_poll();                              /* leftovers from LK */
++	if (!send_cmd(CMD_VERSION, 1, 0) || !wait_for(&rpm_version_ok, 500)) {
++		printf("OP3 RPM: no version answer (rx head %u tail %u)\n",
++		    r32(rpm_rx.head), r32(rpm_rx.tail));
++		return false;
++	}
++	/* OPEN: header + name, name length incl. NUL in param2 */
++	uint32_t open[2 + 4] = {
++		CMD_OPEN | RPM_LCID << 16, sizeof(RPM_CHANNEL),
++	};
++	memcpy(&open[2], RPM_CHANNEL, sizeof(RPM_CHANNEL));
++	if (!tx_write(open, 8 + sizeof(RPM_CHANNEL)) || !wait_for(&rpm_open_ack, 500)) {
++		printf("OP3 RPM: no OPEN_ACK\n");
++		return false;
++	}
++	(void)wait_for(&rpm_remote_open, 500);
++	printf("OP3 RPM: channel \"%s\" open, lcid %u rcid %u remote-open %d\n",
++	    RPM_CHANNEL, RPM_LCID, rpm_rcid, rpm_remote_open);
++	rpm_ready = true;
++	return true;
++}
++
++/* Active-set request: PM8994 LDO enable at microvolt. 0 = acked. */
++int
++op3_rpm_ldoa_enable(uint32_t ldo, uint32_t microvolt)
++{
++	if (!rpm_ready && !rpm_open()) {
++		return -1;
++	}
++	uint32_t pkt[4 + 2 + 6] = {
++		CMD_TX_DATA | RPM_LCID << 16, 0,        /* glink header, intent 0 */
++		0, 0,                                   /* chunk size, left size */
++		RPM_SERVICE_REQ, 20 + 24,               /* rpm header */
++		rpm_msg_id++, 0 /* active set */, RPM_TYPE_LDOA, ldo, 24,
++	};
++	uint32_t kv[6] = { RPM_KEY_SWEN, 4, 1, RPM_KEY_UV, 4, microvolt };
++	uint32_t buf[4 + 7 + 6];
++	memcpy(buf, pkt, 4 * 11);
++	memcpy(&buf[11], kv, sizeof(kv));
++	uint32_t payload = 8 + 20 + 24;
++	buf[2] = payload;
++	rpm_reply = -1000;
++	if (!tx_write(buf, 16 + payload)) {
++		return -1;
++	}
++	for (int i = 0; i < 5000 && rpm_reply == -1000; i++) {
++		rx_poll();
++		delay(100);
++	}
++	printf("OP3 RPM: ldoa%u enable %u uV -> %d\n", ldo, microvolt, rpm_reply);
++	return rpm_reply;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
