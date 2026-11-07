@@ -1,0 +1,66 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 54dac84..74c06a1 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -243,22 +243,19 @@ sweet_early_relocate(uint64_t base)
+ 	 * V=P console (and V=P panic output) still works; the last "ok" line
+ 	 * shows which access never returns.
+ 	 */
++	/*
++	 * 0090 on the device: the screen went BLACK (SoC shut down, not a hang)
++	 * right after "probe 1: fb alias write". Split it up; harmless MDP
++	 * probes first. Each line is on screen before its access runs.
++	 */
+ 	volatile uint8_t *afb = (volatile uint8_t *)(uintptr_t)fb_va;
+ 	volatile uint32_t *amdp = (volatile uint32_t *)(uintptr_t)mdp_va;
+-	sweet_early_string("probe 1: fb alias write\n");
+-	for (unsigned int y = EARLY_HEIGHT - 96; y < EARLY_HEIGHT - 64; y++) {
+-		for (unsigned int x = 0; x < 96 * EARLY_BPP; x++) {
+-			afb[y * EARLY_STRIDE + x] = 0xff;   /* white block above the bars */
+-		}
+-	}
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	early_kick();   /* still the V=P CTL0 */
+-	sweet_early_string("probe 1 ok\n");
+-	sweet_early_string("probe 2: mdp alias read ");
++	sweet_early_string("P1 mdp alias read ");
++	early_kick();
+ 	uint32_t st = amdp[EARLY_DSI_STATUS0];
+ 	early_hex("DSI_STATUS0 ", st);
+ 	sweet_early_string("ok\n");
+-	sweet_early_string("probe 3: mdp alias kick\n");
++	sweet_early_string("P2 mdp alias kick\n");
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	amdp[EARLY_CTL_FLUSH] = EARLY_FLUSH_VIG0;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -266,7 +263,29 @@ sweet_early_relocate(uint64_t base)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	early_wait_dsi(1, 2);
+ 	early_wait_dsi(0, 100);
+-	sweet_early_string("probe 3 ok, switching\n");
++	sweet_early_string("P2 ok\n");
++	/* pixel (0, 1800): below the console rows, above the bars */
++	volatile uint32_t *aw = (volatile uint32_t *)(afb + 1800 * EARLY_STRIDE);
++	volatile uint32_t *vw = (volatile uint32_t *)(early_fb + 1800 * EARLY_STRIDE);
++	sweet_early_string("P3 fb alias read32 ");
++	early_kick();
++	uint32_t v = aw[0];
++	early_hex("got ", v);
++	early_hex("V=P ", vw[0]);
++	sweet_early_string("ok\n");
++	sweet_early_string("P4 fb alias write32\n");
++	aw[0] = 0xffffffffu;
++	__asm__ volatile("dsb sy" ::: "memory");
++	early_hex("P4 ok, V=P reads ", vw[0]);
++	sweet_early_putc('\n');
++	sweet_early_string("P5 fb alias block write\n");
++	for (unsigned int y = EARLY_HEIGHT - 96; y < EARLY_HEIGHT - 64; y++) {
++		for (unsigned int x = 0; x < 96 * EARLY_BPP; x++) {
++			afb[y * EARLY_STRIDE + x] = 0xff;   /* white block above the bars */
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_early_string("P5 ok, switching\n");
+ 	early_fb = (volatile uint8_t *)(uintptr_t)fb_va;
+ 	early_mdp = (volatile uint32_t *)(uintptr_t)mdp_va;
+ 	__asm__ volatile("dsb sy" ::: "memory");
