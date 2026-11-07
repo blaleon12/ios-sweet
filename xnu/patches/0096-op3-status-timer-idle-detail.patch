@@ -1,0 +1,135 @@
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index e9f7324..74ad083 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -495,6 +495,16 @@ cpu_idle(void)
+ 		sweet_fbcon_status(1, 'I', ++sweet_idle_entries);
+ 		sweet_fbcon_status(2, 'C', (uint32_t)__builtin_arm_rsr64("S3_3_C14_C3_1"));   /* CNTV_CTL_EL0 */
+ 		sweet_fbcon_status(3, 'P', (uint32_t)__builtin_arm_rsr64("S3_0_C12_C12_2"));  /* ICC_HPPIR1_EL1 */
++		/* D: next programmed pop (rtcPop) - now, V: CNTV_CVAL - CNTVCT, both in ms */
++		uint64_t now = mach_absolute_time();
++		uint64_t pop = cpu_data_ptr->rtcPop;
++		int64_t d = (pop == EndOfAllTime) ? INT32_MAX : (int64_t)(pop - now) / 19200;
++		uint64_t cval = __builtin_arm_rsr64("S3_3_C14_C3_2");   /* CNTV_CVAL_EL0 */
++		uint64_t cnt = __builtin_arm_rsr64("S3_3_C14_C0_2");    /* CNTVCT_EL0 */
++		int64_t v = (int64_t)(cval - cnt) / 19200;
++		sweet_fbcon_status(5, 'D', (uint32_t)(d > INT32_MAX ? INT32_MAX : d < INT32_MIN ? INT32_MIN : d));
++		sweet_fbcon_status(8, 'V', (uint32_t)(v > INT32_MAX ? INT32_MAX : v < INT32_MIN ? INT32_MIN : v));
++		sweet_fbcon_status(9, 'N', (uint32_t)(now / 19200000ULL));
+ 	}
+ #endif
+ 
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index a1f2a91..ef8c592 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -346,6 +346,14 @@ machine_idle(void)
+ 	 * Idle_load_context()
+ 	 */
+ 	assert((__builtin_arm_rsr("DAIF") & (DAIF_IRQF | DAIF_FIQF)) == (DAIF_IRQF | DAIF_FIQF));
++#if defined(SWEET)
++	{
++		/* OP3 bring-up status: W = machine_idle entries (incl. the WFE path) */
++		extern void sweet_fbcon_status(unsigned int, char, uint32_t);
++		static uint32_t sweet_machine_idle;
++		sweet_fbcon_status(4, 'W', ++sweet_machine_idle);
++	}
++#endif
+ 	/* Check for, and act on, a WFE recommendation.
+ 	 * Bypasses context spill/fill for a minor perf. increment.
+ 	 * May unmask and restore IRQ+FIQ mask.
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 73f5515..7faca7d 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1869,10 +1869,12 @@ sleh_irq(arm_saved_state_t *state)
+ 	}
+ 	if (intid == sweet_vtimer_intid) {
+ 		{
+-			/* OP3 bring-up: timer interrupt counter, top right "T:" */
++			/* OP3 bring-up status: T = timer IRQs, E = interrupted PC, N = seconds */
+ 			extern void sweet_fbcon_status(unsigned int, char, uint32_t);
+ 			static uint32_t sweet_timer_irqs;
+ 			sweet_fbcon_status(0, 'T', ++sweet_timer_irqs);
++			sweet_fbcon_status(6, 'E', (uint32_t)get_saved_state_pc(state));
++			sweet_fbcon_status(9, 'N', (uint32_t)(mach_absolute_time() / 19200000ULL));
+ 		}
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+@@ -1881,6 +1883,12 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_END();
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	} else if (intid < 16) {
++		{
++			/* OP3 bring-up status: Q = non-timer IRQs (IPIs) */
++			extern void sweet_fbcon_status(unsigned int, char, uint32_t);
++			static uint32_t sweet_ipis;
++			sweet_fbcon_status(7, 'Q', ++sweet_ipis);
++		}
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index a1beca1..72782b6 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -718,6 +718,7 @@ register_serial_functions(struct pe_serial_functions *fns)
+ extern unsigned char iso_font[256 * 16];
+ 
+ #define FBCON_SCALE     2
++#define FBCON_STATUS_ROWS 2   /* OP3 bring-up: top rows reserved for sweet_fbcon_status */
+ #define FBCON_FG        0xffffffffu
+ #define FBCON_BG        0xff000000u
+ 
+@@ -811,16 +812,21 @@ fbcon_glyph_at(uint32_t x0, uint32_t y0, unsigned char c)
+ void
+ sweet_fbcon_status(unsigned int slot, char tag, uint32_t value)
+ {
+-	const uint32_t cw = 8 * FBCON_SCALE, chars = 11;   /* "T:XXXXXXXX " */
+-	if (fbcon_base == NULL || (slot + 1) * chars * cw > fbcon_width) {
++	const uint32_t cw = 8 * FBCON_SCALE, ch = 16 * FBCON_SCALE, chars = 11;   /* "T:XXXXXXXX " */
++	if (fbcon_base == NULL || fbcon_width < chars * cw) {
+ 		return;
+ 	}
+-	uint32_t x = fbcon_width - (slot + 1) * chars * cw;
+-	fbcon_glyph_at(x, 0, (unsigned char)tag);
+-	fbcon_glyph_at(x + cw, 0, ':');
++	const uint32_t per_row = fbcon_width / (chars * cw);
++	if (slot >= per_row * FBCON_STATUS_ROWS) {
++		return;
++	}
++	uint32_t x = fbcon_width - (slot % per_row + 1) * chars * cw;
++	uint32_t y = (slot / per_row) * ch;
++	fbcon_glyph_at(x, y, (unsigned char)tag);
++	fbcon_glyph_at(x + cw, y, ':');
+ 	for (int i = 0; i < 8; i++) {
+ 		unsigned d = (value >> (28 - 4 * i)) & 0xf;
+-		fbcon_glyph_at(x + (2 + i) * cw, 0, (unsigned char)(d < 10 ? '0' + d : 'A' + d - 10));
++		fbcon_glyph_at(x + (2 + i) * cw, y, (unsigned char)(d < 10 ? '0' + d : 'A' + d - 10));
+ 	}
+ 	if (fbcon_kick_regs != NULL && (fbcon_busy_reg == NULL || !(*fbcon_busy_reg & fbcon_busy_mask))) {
+ 		__asm__ volatile("dsb sy" ::: "memory");
+@@ -844,10 +850,11 @@ fbcon_clear_row(uint32_t row)
+ static void
+ fbcon_newline(void)
+ {
++	/* OP3 bring-up: rows 0-1 are the status area (sweet_fbcon_status) */
+ 	fbcon_col = 0;
+-	fbcon_row = (fbcon_row + 1) % fbcon_rows;
++	fbcon_row = fbcon_row + 1 < fbcon_rows ? fbcon_row + 1 : FBCON_STATUS_ROWS;
+ 	fbcon_clear_row(fbcon_row);
+-	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++	fbcon_clear_row(fbcon_row + 1 < fbcon_rows ? fbcon_row + 1 : FBCON_STATUS_ROWS);
+ 	fbcon_kick();
+ }
+ 
+@@ -856,7 +863,8 @@ fbcon_init(void)
+ {
+ 	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
+ 	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
+-	fbcon_col = fbcon_row = 0;
++	fbcon_col = 0;
++	fbcon_row = FBCON_STATUS_ROWS;
+ 	for (uint32_t r = 0; r < fbcon_rows; r++) {
+ 		fbcon_clear_row(r);
+ 	}
