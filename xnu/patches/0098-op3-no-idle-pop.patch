@@ -1,0 +1,25 @@
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 3810826..d33bace 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -371,7 +371,20 @@ cpu_interrupt_is_pending(void)
+ static bool
+ cpu_proximate_timer(void)
+ {
++#if defined(SWEET)
++	/*
++	 * OnePlus 3: no idle pop. SetIdlePop() pulls the hardware timer forward
++	 * by cpu_idle_latency before WFI and ClearIdlePop() restores rtcPop only
++	 * if CNTV ISTATUS is clear. With the vtimer as a Group 1 IRQ (not Apple's
++	 * timer FIQ) this lost deadlines: roughly every other boot the IORTC
++	 * wait's 30 s pop vanished and the CPU slept until the next 111.8 s
++	 * maximum pop or forever. With idle disabled (jtag=1) 4/4 boots were
++	 * fine. Keep WFI, leave the hardware timer on the real deadline.
++	 */
++	return false;
++#else
+ 	return !SetIdlePop();
++#endif
+ }
+ 
+ #ifdef ARM64_BOARD_CONFIG_T6000
