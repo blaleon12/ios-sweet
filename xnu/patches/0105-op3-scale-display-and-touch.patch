@@ -1,0 +1,302 @@
+diff --git a/bsd/dev/op3_input.c b/bsd/dev/op3_input.c
+index bb56cf8..7c8df7d 100644
+--- a/bsd/dev/op3_input.c
++++ b/bsd/dev/op3_input.c
+@@ -623,6 +623,46 @@ op3_input_thread(void *arg, wait_result_t result)
+ 	}
+ }
+ 
++/*
++ * Boot-arg op3reboot=N: N minutes after the root device is up, restart into
++ * TWRP (IMEM restart reason 0x77665502 + PSCI SYSTEM_RESET, as the shim
++ * does), so unattended test runs end where the persistent log can be read.
++ * The 15 s pause lets the sweetlog thread (every 10 s) save the last lines.
++ */
++#define OP3_IMEM_PA             0x066bf000u
++#define OP3_IMEM_RESTART_REASON 0x65cu
++#define OP3_RESTART_RECOVERY    0x77665502u
++#define PSCI_SYSTEM_RESET       0x84000009ul
++
++static uint32_t op3_reboot_min;
++
++static void
++op3_reboot_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	for (uint32_t m = 0; m < op3_reboot_min; m++) {
++		op3_sleep_ms(60000);
++	}
++	printf("OP3: op3reboot=%u: restarting into TWRP in 15 s\n", op3_reboot_min);
++	op3_sleep_ms(15000);
++	vm_offset_t imem = ml_io_map(OP3_IMEM_PA, 0x1000);
++	if (imem == 0) {
++		printf("OP3: op3reboot: IMEM mapping failed\n");
++		return;
++	}
++	wr32(imem, OP3_IMEM_RESTART_REASON, OP3_RESTART_RECOVERY);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++	    "x16", "x17", "memory");
++	printf("OP3: op3reboot: PSCI SYSTEM_RESET returned %#llx\n", (unsigned long long)x0);
++}
++
+ void
+ op3_input_init(void)
+ {
+@@ -634,11 +674,23 @@ op3_input_init(void)
+ 		return;
+ 	}
+ 	started = true;
+-	/* Default on only on the OnePlus 3 (LK's 1080x1920 RGB888 boot framebuffer). */
++	if (PE_parse_boot_argn("op3reboot", &op3_reboot_min, sizeof(op3_reboot_min)) &&
++	    op3_reboot_min != 0) {
++		thread_t rt;
++		if (kernel_thread_start(op3_reboot_thread, NULL, &rt) == KERN_SUCCESS) {
++			thread_deallocate(rt);
++			printf("OP3: op3reboot: restart into TWRP after %u min\n", op3_reboot_min);
++		}
++	}
++	/*
++	 * Default on only on the OnePlus 3 (LK's 1080x1920 RGB888 boot
++	 * framebuffer); touch = 2: L22 through the RPM (0104, verified).
++	 */
+ 	PE_Video video;
+ 	PE_current_console(&video);
+-	op3_touch_mode = op3_keys_on = (video.v_width == 1080 && video.v_height == 1920 &&
+-	    video.v_depth == 24) ? 1 : 0;
++	bool op3 = video.v_width == 1080 && video.v_height == 1920 && video.v_depth == 24;
++	op3_touch_mode = op3 ? 2 : 0;
++	op3_keys_on = op3 ? 1 : 0;
+ 	(void)PE_parse_boot_argn("op3touch", &op3_touch_mode, sizeof(op3_touch_mode));
+ 	(void)PE_parse_boot_argn("op3keys", &op3_keys_on, sizeof(op3_keys_on));
+ 	(void)PE_parse_boot_argn("op3touchlog", &op3_touch_log, sizeof(op3_touch_log));
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8e3fbd0..6add978 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -106,6 +106,9 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScaled;                  /* sweetfb_scale: shrink to the panel */
++	uint32_t      fScaledW, fScaledX;       /* scaled width, left panel column */
++	uint16_t     *fColMap;                  /* panel column - fScaledX -> logical x */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -133,6 +136,8 @@ public:
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void flushPanel(void);
++	void presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
++	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -209,6 +214,31 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/*
++	 * Scaling (OnePlus 3): instead of showing the middle of the presented
++	 * display (losing 258 lines top and bottom: status bar, home indicator),
++	 * shrink it to the panel height keeping the aspect ratio (1125x2436 ->
++	 * 887x1920 at x 96), nearest neighbour. Default on when more than 64
++	 * lines would be cut; boot-arg sweetfb_scale=0/1. SweetHID.cpp maps
++	 * touches back with the same rule.
++	 */
++	int scale = (fLogicalH > fHeight + 64) ? 1 : 0;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	if (scale && fLogicalH > fHeight) {
++		fScaledW = (uint32_t)(((uint64_t)fLogicalW * fHeight + fLogicalH / 2) / fLogicalH);
++		if (fScaledW > fWidth) {
++			fScaledW = fWidth;
++		}
++		fScaledX = (fWidth - fScaledW) / 2;
++		fColMap = (uint16_t *)IOMalloc(fScaledW * sizeof(uint16_t));
++		if (fColMap != NULL) {
++			for (uint32_t px = 0; px < fScaledW; px++) {
++				uint32_t lx = (uint32_t)(((uint64_t)px * fLogicalH) / fHeight);
++				fColMap[px] = (uint16_t)(lx < fLogicalW ? lx : fLogicalW - 1);
++			}
++			fScaled = true;
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = fShadow ?
+@@ -264,6 +294,9 @@ AppleCLCD::start(IOService *provider)
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+ 	    fShadow ? ", RGB888 panel via 32-bit shadow" : "");
++	if (fScaled) {
++		IOLog("SWEET FB: scaled to %ux%u at panel x %u\n", fScaledW, fHeight, fScaledX);
++	}
+ 	return true;
+ }
+ 
+@@ -413,6 +446,75 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/*
++ * One layer in scaled mode: source rect (sx,sy) w x h at logical (dx,dy),
++ * nearest neighbour into the panel window fScaledX..+fScaledW x fHeight.
++ * Panel row py shows logical row py * fLogicalH / fHeight (fColMap the same
++ * for columns), so a logical rect [d, d+n) covers the panel pixels
++ * [ceil(d * H / LH), ceil((d + n) * H / LH)).
++ */
++void
++AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
++    int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	const uint32_t H = fHeight, LH = fLogicalH;
++
++	if (src == 0 || bpe != 4 || s->elementWidth != 1 || s->elementHeight != 1 ||
++	    s->memory == NULL) {
++		return;
++	}
++	if (w <= 0 || h <= 0) {
++		w = (int32_t)s->width;
++		h = (int32_t)s->height;
++	}
++	if (w > (int32_t)s->width - sx) {
++		w = (int32_t)s->width - sx;
++	}
++	if (h > (int32_t)s->height - sy) {
++		h = (int32_t)s->height - sy;
++	}
++	if (w > (int32_t)fLogicalW - dx) {
++		w = (int32_t)fLogicalW - dx;
++	}
++	if (h > (int32_t)fLogicalH - dy) {
++		h = (int32_t)fLogicalH - dy;
++	}
++	if (w <= 0 || h <= 0) {
++		return;
++	}
++	uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++	    (uint64_t)(sx + w) * 4;
++	if (last > s->memory->getLength()) {
++		return;
++	}
++	uint32_t py0 = (uint32_t)(((uint64_t)dy * H + LH - 1) / LH);
++	uint32_t py1 = (uint32_t)(((uint64_t)(dy + h) * H + LH - 1) / LH);
++	uint32_t cx0 = (uint32_t)(((uint64_t)dx * H + LH - 1) / LH);
++	uint32_t cx1 = (uint32_t)(((uint64_t)(dx + w) * H + LH - 1) / LH);
++	if (py1 > H) {
++		py1 = H;
++	}
++	if (cx1 > fScaledW) {
++		cx1 = fScaledW;
++	}
++	const uintptr_t base = src + s->offset;
++	for (uint32_t py = py0; py < py1; py++) {
++		uint32_t ly = (uint32_t)(((uint64_t)py * LH) / H);
++		if (ly < (uint32_t)dy || ly >= (uint32_t)(dy + h)) {
++			continue;
++		}
++		const uint32_t *srow = (const uint32_t *)(base +
++		    (uint64_t)(sy + (int32_t)ly - dy) * s->bytesPerRow) + (sx - dx);
++		uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes) + fScaledX;
++		for (uint32_t cx = cx0; cx < cx1; cx++) {
++			uint32_t lx = fColMap[cx];
++			if (lx >= (uint32_t)dx && lx < (uint32_t)(dx + w)) {
++				drow[cx] = srow[lx];
++			}
++		}
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -464,6 +566,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScaled) {
++			presentScaled(s, src, bpe, sx, sy, dx, dy, w, h);
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 3f2d263..3507307 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -369,6 +369,8 @@ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	int fPanelW, fPanelH;          /* boot framebuffer = panel pixels */
++	bool fScaled;                  /* sweetfb_scale (SweetFramebuffer.cpp) */
++	int fScaledX;                  /* left panel column of the scaled picture */
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -448,14 +450,22 @@ SweetHIDTouch::start(IOService *provider)
+ 	fLogicalH = (native || !fits) ? fPanelH : 2436;
+ 	fOffX = (fLogicalW - fPanelW) / 2;
+ 	fOffY = (fLogicalH - fPanelH) / 2;
++	/* Same rule as SweetFramebuffer.cpp: shrink the presented display to the panel. */
++	int scale = (fLogicalH > fPanelH + 64) ? 1 : 0;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	fScaled = scale && fLogicalH > fPanelH;
++	if (fScaled) {
++		int sw = (int)(((int64_t)fLogicalW * fPanelH + fLogicalH / 2) / fLogicalH);
++		fScaledX = sw < fPanelW ? (fPanelW - sw) / 2 : 0;
++	}
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+-	IOLog("SWEET HID: touch registered, panel %dx%d presented as %dx%d\n",
+-	    fPanelW, fPanelH, fLogicalW, fLogicalH);
++	IOLog("SWEET HID: touch registered, panel %dx%d presented as %dx%d%s\n",
++	    fPanelW, fPanelH, fLogicalW, fLogicalH, fScaled ? " (scaled)" : "");
+ 	return true;
+ }
+ 
+@@ -475,16 +485,28 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	int lx = x + fOffX, ly = y + fOffY;
++	if (fScaled) {
++		lx = (int)(((int64_t)(x - fScaledX) * fLogicalH) / fPanelH);
++		ly = (int)(((int64_t)y * fLogicalH) / fPanelH);
++		lx = lx < 0 ? 0 : (lx > fLogicalW - 1 ? fLogicalW - 1 : lx);
++		ly = ly < 0 ? 0 : (ly > fLogicalH - 1 ? fLogicalH - 1 : ly);
++	}
++	IOFixed nx = (IOFixed)(((int64_t)lx << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)(((int64_t)ly << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_PX;
++		if (fScaled) {
++			fEdge[finger] = lx < SWEET_TOUCH_EDGE_PX || lx > fLogicalW - 1 - SWEET_TOUCH_EDGE_PX ||
++			    ly < SWEET_TOUCH_EDGE_PX || ly > fLogicalH - 1 - SWEET_TOUCH_EDGE_PX;
++		} else {
++			fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
++			    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_PX;
++		}
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
