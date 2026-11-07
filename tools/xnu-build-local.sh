@@ -5,7 +5,7 @@
 # Needs: Xcode 16.0 at /Applications/Xcode_16.app (same as the CI runner),
 #        and KDK 13.5 (22G74) in /Library/Developer/KDKs (build.sh would
 #        otherwise try to sudo-install it). No Homebrew: bash 5, cmake and ninja
-#        are set up under $XNU_WORK/tools on the first run, jq ships with macOS 15.
+#        are set up under ~/xnu-tools (XNU_TOOLS) on the first run, jq ships with macOS 15.
 #
 # usage: tools/xnu-build-local.sh [--reset] [--clean] [--keep-going]
 #   (default)     incremental: copy patches, apply the ones not yet applied,
@@ -47,7 +47,8 @@ done
 ls -d /Library/Developer/KDKs/KDK_13.5_22G74.kdk >/dev/null 2>&1 || echo "warning: KDK 13.5 (22G74) not installed, build.sh will try to sudo-install it"
 
 # ---- tools without Homebrew (Homebrew no longer supports Intel Macs) ----
-TOOLS=$WORK/tools
+# shared by all work dirs (local ~/xnu-work and the CI runner's ~/xnu-work-ci)
+TOOLS=${XNU_TOOLS:-$HOME/xnu-tools}
 BASH_VER=5.2.37
 mkdir -p "$TOOLS/bin" "$WORK/out"
 export PATH="$TOOLS/bin:$TOOLS/venv/bin:$PATH"
@@ -65,7 +66,11 @@ fi
 if [ ! -x "$TOOLS/bin/bash" ]; then
     echo "== building GNU bash $BASH_VER"
     src=$(mktemp -d)
-    curl -sSLf "https://ftp.gnu.org/gnu/bash/bash-$BASH_VER.tar.gz" | tar xzf - -C "$src"
+    for m in https://ftpmirror.gnu.org/bash https://ftp.gnu.org/gnu/bash https://mirrors.kernel.org/gnu/bash; do
+        curl -sSLf --connect-timeout 20 --max-time 300 --retry 2 -o "$src/bash.tgz" "$m/bash-$BASH_VER.tar.gz" && break
+        echo "   $m failed"
+    done
+    tar xzf "$src/bash.tgz" -C "$src"
     (cd "$src/bash-$BASH_VER" && ./configure -q --prefix="$TOOLS" --without-bash-malloc >/dev/null && make -s -j"$(sysctl -n hw.ncpu)" >/dev/null && make -s install >/dev/null)
     rm -rf "$src"
 fi
