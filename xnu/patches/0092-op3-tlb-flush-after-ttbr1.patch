@@ -1,0 +1,21 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 4863a91..a7ec3a4 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2192,6 +2192,16 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #endif
+ 	arm_vm_physmap_init(args);
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
++#if defined(SWEET)
++	/*
++	 * set_mmu_ttb_alternate does not invalidate. Kernel mappings are global,
++	 * so TLB/walk-cache entries from the bootstrap TTBR1 tables survive until
++	 * the flush after TTBR0 teardown. On the OnePlus 3 (Kryo) the first access
++	 * through the early-console aliases then used a stale walk and hit a
++	 * protected PA: the SoC shut down (AT itself reported the right PA).
++	 */
++	flush_mmu_tlb();
++#endif
+ 
+ 	ml_enable_monitor();
+ 
