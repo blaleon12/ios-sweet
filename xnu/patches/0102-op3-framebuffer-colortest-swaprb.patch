@@ -1,0 +1,76 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b2b10b6..8e3fbd0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -125,6 +125,7 @@ public:
+ 	 * memory and kicks the panel (sweet_fbcon_panel_kick).
+ 	 */
+ 	bool          fShadow;
++	bool          fSwapRB;        /* boot-arg sweetfb_swaprb=1: panel wants R,G,B */
+ 	uintptr_t     fPanel;         /* kernel mapping of the real panel memory */
+ 	uint32_t      fPanelRowBytes;
+ 	IOMemoryDescriptor *fPanelMem;
+@@ -191,6 +192,9 @@ AppleCLCD::start(IOService *provider)
+ 			IOLog("SWEET FB: cannot map the RGB888 panel at 0x%llx\n", fPhys);
+ 			return false;
+ 		}
++		int swaprb = 0;
++		PE_parse_boot_argn("sweetfb_swaprb", &swaprb, sizeof(swaprb));
++		fSwapRB = swaprb != 0;
+ 	} else if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+@@ -218,6 +222,31 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	int colortest = 0;
++	if (fShadow && PE_parse_boot_argn("sweetfb_colortest", &colortest, sizeof(colortest)) &&
++	    colortest != 0) {
++		/*
++		 * Colour test: four vertical stripes red | green | blue | white
++		 * (BGRA shadow values), shown through flushPanel() for 20 s.
++		 */
++		static const uint32_t stripes[4] = {
++			0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffffffffu,
++		};
++		for (uint32_t y = 0; y < fHeight; y++) {
++			uint32_t *row = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++			for (uint32_t x = 0; x < fWidth; x++) {
++				row[x] = stripes[(x * 4) / fWidth];
++			}
++		}
++		IOLog("SWEET FB: colour test (swaprb=%d): left to right RED GREEN BLUE WHITE\n",
++		    fSwapRB ? 1 : 0);
++		for (int i = 0; i < 10; i++) {
++			flushPanel();
++			IOSleep(2000);
++		}
++		bzero((void *)fPixels, (size_t)fRowBytes * fHeight);
++		flushPanel();
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -243,7 +272,8 @@ extern "C" bool sweet_fbcon_panel_kick(void);   /* pexpert/arm/pe_serial.c */
+ /*
+  * Shadow mode: copy the BGRA shadow into the RGB888 panel memory (bytes
+  * B,G,R: drop every 4th byte), 8 pixels = 24 bytes as three 64-bit stores,
+- * then kick the command-mode panel.
++ * then kick the command-mode panel. sweetfb_swaprb=1 writes R,G,B instead
++ * (byte stores). Boot-arg sweetfb_colortest=1 shows R|G|B|W stripes for 20 s.
+  */
+ void
+ AppleCLCD::flushPanel(void)
+@@ -255,6 +285,11 @@ AppleCLCD::flushPanel(void)
+ 		const uint32_t *s = (const uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
+ 		volatile uint8_t *d = (volatile uint8_t *)(fPanel + (uint64_t)y * fPanelRowBytes);
+ 		uint32_t x = 0;
++		for (; fSwapRB && x < fWidth; x++, s++, d += 3) {
++			d[0] = (uint8_t)(*s >> 16);
++			d[1] = (uint8_t)(*s >> 8);
++			d[2] = (uint8_t)*s;
++		}
+ 		for (; x + 8 <= fWidth; x += 8, s += 8, d += 24) {
+ 			uint64_t p0 = s[0] & 0xffffff, p1 = s[1] & 0xffffff, p2 = s[2] & 0xffffff;
+ 			uint64_t p3 = s[3] & 0xffffff, p4 = s[4] & 0xffffff, p5 = s[5] & 0xffffff;
