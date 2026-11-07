@@ -1,0 +1,93 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..cf3e2a2 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -618,20 +618,37 @@ sweet_ufs_init(void)
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+-	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
++	/*
++	 * OnePlus 3 (MSM8996): the partitions are spread over several UFS LUNs.
++	 * Search LUN 0-7 for the partition unless ufslun=N names one; every
++	 * command here is a read.
++	 */
++	uint32_t only_lun = UINT32_MAX;
++	PE_parse_boot_argn("ufslun", &only_lun, sizeof(only_lun));
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+-		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		error = ENOENT;
++		for (uint32_t lun = 0; lun < 8 && error; lun++) {
++			if (only_lun != UINT32_MAX && lun != only_lun) {
++				continue;
++			}
++			su.lun = (uint8_t)lun;
++			static const uint8_t tur[6] = { 0x00 };
++			/* The first command after the bootloader may report a unit attention. */
++			int terr = 0;
++			for (int i = 0; i < 3 && (terr = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			}
++			if (terr) {
++				printf("SWEET UFS: LUN %u not ready (%d)\n", lun, terr);
++				error = terr;
++				continue;
++			}
++			error = ufs_find_partition(want);
+ 		}
+ 	}
+-	if (!error) {
+-		error = ufs_find_partition(want);
+-	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;
+@@ -805,6 +822,19 @@ sweet_log_start(void)
+ 	}
+ }
+ 
++/*
++ * Boot-arg ufsprobe=1 (OnePlus 3 bring-up): bring the driver up while the
++ * root is still elsewhere (rd=md0), only to report the host state, the LUN
++ * scan and the partition. Read-only unless ufsrw=1; errors are returned.
++ */
++int sweet_ufs_probe(void);
++
++int
++sweet_ufs_probe(void)
++{
++	return su.ready ? 0 : sweet_ufs_init();
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..9d20170 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -768,6 +768,19 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ //
++//	OnePlus 3 bring-up: ufsprobe=1 brings the UFS driver up (read-only unless
++//	ufsrw=1) and reports what it found, while the root stays elsewhere.
++//
++	{
++		uint32_t ufsprobe = 0;
++		if (strcmp(rdBootVar, "ufsroot0") != 0 &&
++		    PE_parse_boot_argn("ufsprobe", &ufsprobe, sizeof(ufsprobe)) && ufsprobe) {
++			extern int sweet_ufs_probe(void);
++			int probe_error = sweet_ufs_probe();
++			IOLog("SWEET UFS: probe %s (%d)\n", probe_error ? "FAILED" : "ok", probe_error);
++		}
++	}
++//
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+ //
+ 	if (strcmp(rdBootVar, "ufsroot0") == 0) {

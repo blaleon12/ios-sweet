@@ -60,6 +60,10 @@ OP3_BUSY_REG, OP3_BUSY_SIZE, OP3_BUSY_OFF, OP3_BUSY_MASK = 0x994000, 0x1000, 0x8
 # ramoops console zone (no-map carve-out below the kernel's RAM): fbcon mirrors
 # the kernel console into it, readable in TWRP after a forced reset
 OP3_RAMOOPS, OP3_RAMOOPS_SIZE = 0xac080000, 0x100000
+# UFS host left running by LK (stock DTB: ufshc@624000 reg <0x624000 0x2500>,
+# jedec,ufs-1.1, QMP 14nm PHY at 0x627000, ICE at 0x630000). Only with --op3-ufs:
+# sweet_ufs.c then probes the LUNs for a GPT partition (read-only unless ufsrw=1).
+OP3_UFS, OP3_UFS_SIZE = 0x624000, 0x2500
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -96,7 +100,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, op3=False):
+def build(seed=None, qemu=False, highmem=False, op3=False, op3_ufs=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     op3=True: OnePlus 3 (MSM8996) hardware instead of the Redmi Note 10 Pro."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
@@ -250,7 +254,7 @@ def build(seed=None, qemu=False, highmem=False, op3=False):
     ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
+        ('reg', u64(OP3_UFS, OP3_UFS_SIZE) if op3 else u64(UFS, UFS_SIZE)),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -288,11 +292,12 @@ def build(seed=None, qemu=False, highmem=False, op3=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu or op3 else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu or (op3 and not op3_ufs) else [ufs]))
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, op3='--op3' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 op3='--op3' in sys.argv or '--op3-ufs' in sys.argv, op3_ufs='--op3-ufs' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
