@@ -1,0 +1,75 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 7acda17..f55dc05 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1853,7 +1853,8 @@ sweet_early_map_final(void)
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+-	__asm__ volatile("dsb ishst" ::: "memory");
++	/* make the new blocks visible to the walker; drop any cached walks */
++	__asm__ volatile("dsb ish; tlbi vmalle1; dsb ish; isb" ::: "memory");
+ }
+ #endif
+ 
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index ed53eff..ad2e78a 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -191,14 +191,54 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	early_kick();
+ }
+ 
++static void
++early_hex(const char *label, uint64_t v)
++{
++	sweet_early_string(label);
++	for (int i = 60; i >= 0; i -= 4) {
++		unsigned d = (unsigned)(v >> i) & 0xf;
++		sweet_early_putc((char)(d < 10 ? '0' + d : 'A' + d - 10));
++	}
++	sweet_early_putc(' ');
++}
++
++/* stage-1 EL1 read translation of va; PAR_EL1 bit0 = fault */
++static uint64_t
++early_at(uint64_t va)
++{
++	uint64_t par;
++	__asm__ volatile("at s1e1r, %1; isb; mrs %0, par_el1" : "=r"(par) : "r"(va) : "memory");
++	return par;
++}
++
+ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+ 	/* base: alias of the framebuffer block; the next 32MB alias is the MMIO
+ 	 * block at PA 0 (see sweet_early_map_final). */
+-	early_fb = (volatile uint8_t *)(uintptr_t)(base + (EARLY_FB_PA - EARLY_FB_BLOCK));
+-	early_mdp = (volatile uint32_t *)(uintptr_t)(base + 0x2000000ULL + EARLY_MDP_CTL0);
++	uint64_t fb_va = base + (EARLY_FB_PA - EARLY_FB_BLOCK);
++	uint64_t mdp_va = base + 0x2000000ULL + EARLY_MDP_CTL0;
++	/* Check both aliases while the V=P console still works (OP3 bring-up). */
++	uint64_t par_fb = early_at(fb_va), par_mdp = early_at(mdp_va);
++	uint64_t ttbr1, tcr;
++	__asm__ volatile("mrs %0, ttbr1_el1; mrs %1, tcr_el1" : "=r"(ttbr1), "=r"(tcr));
++	early_hex("FBVA ", fb_va);
++	early_hex("PAR ", par_fb);
++	sweet_early_putc('\n');
++	early_hex("MDPVA ", mdp_va);
++	early_hex("PAR ", par_mdp);
++	sweet_early_putc('\n');
++	early_hex("TTBR1 ", ttbr1);
++	early_hex("TCR ", tcr);
++	sweet_early_putc('\n');
++	if ((par_fb & 1) || (par_mdp & 1)) {
++		/* Alias not mapped: stay on V=P (works until TTBR0 is dropped). */
++		sweet_early_string("SWEET EARLY: alias FAULT, staying on V=P\n");
++		return;
++	}
++	early_fb = (volatile uint8_t *)(uintptr_t)fb_va;
++	early_mdp = (volatile uint32_t *)(uintptr_t)mdp_va;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
