@@ -1,0 +1,160 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index d74c063..d6d4b47 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -68,6 +68,12 @@ SECURITY_READ_ONLY_LATE(static IOPlatformExpertDevice*) gRootNub;
+ 
+ #include <kern/clock.h>
+ #include <sys/time.h>
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(SWEET)
++boolean_t ml_get_interrupts_enabled(void);
++#endif
+ 
+ void
+ IOKitInitializeTime( void )
+@@ -77,6 +83,9 @@ IOKitInitializeTime( void )
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
++#if defined(SWEET)
++	kprintf("SWEET TIME: waiting for IORTC (30 s) IRQs=%u\n", ml_get_interrupts_enabled());
++#endif
+ // RTC is not present on this target
+ #ifndef BCM2837
+ 	IOService::waitForService(
+@@ -87,7 +96,13 @@ IOKitInitializeTime( void )
+ 		IOService::resourceMatching("IONVRAM"), &t );
+ #endif
+ 
++#if defined(SWEET)
++	kprintf("SWEET TIME: IORTC wait over; clock_initialize_calendar\n");
++#endif
+ 	clock_initialize_calendar();
++#if defined(SWEET)
++	kprintf("SWEET TIME: calendar initialized\n");
++#endif
+ }
+ 
+ void
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 4f7a8a7..09c0539 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -150,7 +150,12 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++		/* OP3 bring-up: sporadic hang around here, trace every step. */
++		kprintf("SWEET CPU: cpu=%u processor_start ... IRQs=%u\n", i, ml_get_interrupts_enabled());
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
++		kprintf("SWEET CPU: cpu=%u processor_start returned %d IRQs=%u init=%u sig=%u\n", i, kr,
++		    ml_get_interrupts_enabled(), __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++		    (unsigned)sweet_cpu_signal_is_enabled(i));
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+@@ -158,6 +163,13 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
++			static bool once;
++			if (!once) {
++				once = true;
++				kprintf("SWEET CPU: cpu=%u waiting: init=%u sig=%u IRQs=%u\n", i,
++				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++				    (unsigned)sweet_cpu_signal_is_enabled(i), ml_get_interrupts_enabled());
++			}
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+ 				    i, topology->cpus[i].phys_id);
+@@ -169,9 +181,13 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		    i, topology->cpus[i].phys_id);
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
++	kprintf("SWEET CPU: ml_cpu_init_completed\n");
+ 	ml_cpu_init_completed();
++	kprintf("SWEET CPU: cpusRunning\n");
+ 	__atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
++	kprintf("SWEET CPU: publishResource\n");
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
++	kprintf("SWEET CPU: ml_set_max_cpus\n");
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 2a2b01b..a1beca1 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -869,9 +869,61 @@ fbcon_transmit_ready(void)
+ 	return 1;
+ }
+ 
++/*
++ * OP3 bring-up: mirror every console byte into the ramoops console zone the
++ * op3shim already writes (Linux persistent_ram: "DBGC", start, size, data).
++ * It survives the forced reset after a hang; read it in TWRP with
++ * cat /sys/fs/pstore/console-ramoops. Optional ADT "ramoops-reg" <phys size>.
++ */
++static volatile uint32_t *ramoops_hdr;
++static uint32_t ramoops_cap;
++
++static void
++ramoops_probe(DTEntry entry)
++{
++	uint64_t const *reg;
++	unsigned int size;
++	if (SecureDTGetProperty(entry, "ramoops-reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 16 || reg[1] < 4096) {
++		return;
++	}
++	volatile uint32_t *h = (volatile uint32_t *)ml_io_map(reg[0], reg[1]);
++	if (h == NULL) {
++		return;
++	}
++	ramoops_cap = (uint32_t)reg[1] - 12;
++	if (h[0] != 0x43474244u || h[2] > ramoops_cap) {   /* no shim log: start fresh */
++		h[0] = 0x43474244u;
++		h[1] = 0;
++		h[2] = 0;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	ramoops_hdr = h;
++}
++
++static void
++ramoops_putc(uint8_t c)
++{
++	volatile uint32_t *h = ramoops_hdr;
++	if (h == NULL) {
++		return;
++	}
++	uint32_t len = h[2];
++	if (len >= ramoops_cap) {
++		return;
++	}
++	((volatile uint8_t *)h)[12 + len] = c;
++	h[1] = len + 1;
++	h[2] = len + 1;
++	if (c == '\n') {
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++	ramoops_putc(c);
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
+@@ -970,6 +1022,7 @@ fbcon_probe(void)
+ 			}
+ 		}
+ 	}
++	ramoops_probe(entry);
+ 	sweet_early_mark(17, "fbcon config read; mapping");
+ 	fbcon_base = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);
+ 	sweet_early_mark(18, "fbcon mapping returned");

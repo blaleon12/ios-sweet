@@ -57,6 +57,9 @@ OP3_KICK_REG, OP3_KICK_SIZE, OP3_KICK_FLUSH = 0x902000, 0x1000, 0x22041
 # DSI0 STATUS0: busy while a frame is on the link; fbcon waits on it around
 # each kick (patch 0087), a kick mid-transfer garbles the panel image
 OP3_BUSY_REG, OP3_BUSY_SIZE, OP3_BUSY_OFF, OP3_BUSY_MASK = 0x994000, 0x1000, 0x8, 0x5
+# ramoops console zone (no-map carve-out below the kernel's RAM): fbcon mirrors
+# the kernel console into it, readable in TWRP after a forced reset
+OP3_RAMOOPS, OP3_RAMOOPS_SIZE = 0xac080000, 0x100000
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -240,6 +243,7 @@ def build(seed=None, qemu=False, highmem=False, op3=False):
             ('busy-reg', u64(OP3_BUSY_REG, OP3_BUSY_SIZE)),
             ('busy-offset', u32(OP3_BUSY_OFF)),
             ('busy-mask', u32(OP3_BUSY_MASK)),
+            ('ramoops-reg', u64(OP3_RAMOOPS, OP3_RAMOOPS_SIZE)),
         ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
