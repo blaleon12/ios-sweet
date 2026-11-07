@@ -64,6 +64,10 @@ OP3_RAMOOPS, OP3_RAMOOPS_SIZE = 0xac080000, 0x100000
 # jedec,ufs-1.1, QMP 14nm PHY at 0x627000, ICE at 0x630000). Only with --op3-ufs:
 # sweet_ufs.c then probes the LUNs for a GPT partition (read-only unless ufsrw=1).
 OP3_UFS, OP3_UFS_SIZE = 0x624000, 0x2500
+# /arm-io/wlan and /arm-io/bluetooth local-mac-address for MobileGestalt
+# (locally administered: bit 1 of the first byte set, 'SWEET' after it)
+OP3_WLAN_MAC = bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x01])
+OP3_BT_MAC = bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x02])
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -224,7 +228,18 @@ def build(seed=None, qemu=False, highmem=False, op3=False, op3_ufs=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])])
+        ])] + ([
+        # OnePlus 3 (no network controller): MobileGestalt computes the A11
+        # UniqueDeviceID from the Wi-Fi and Bluetooth addresses. Without a
+        # node it looks for (IONameMatch sdio/wlan/marconi-wifi) it waits
+        # forever for an IONetworkController, and with it lsd's database
+        # seeding, SpringBoard and the whole GUI. iBoot fills these in on an
+        # iPhone; here: synthetic locally administered addresses.
+        node('wlan', [ph(), ('compatible', cstr('wlan')),
+                      ('local-mac-address', OP3_WLAN_MAC)]),
+        node('bluetooth', [ph(), ('compatible', cstr('bluetooth')),
+                           ('local-mac-address', OP3_BT_MAC)]),
+    ] if op3 else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
