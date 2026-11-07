@@ -1,0 +1,126 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 7c733a3..ed53eff 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -53,14 +53,46 @@ early_px(unsigned int x, unsigned int y, uint32_t argb)
+ 	p[2] = (uint8_t)(argb >> 16);
+ }
+ 
++/*
++ * A CTL START while the previous frame is still on the DSI link cuts that
++ * frame short; the panel then continues the next one at the old write
++ * position (text lands mid-screen, wrapped). So every kick waits for the
++ * link to go idle, starts the frame and waits for it to finish.
++ * DSI0 STATUS0 (PA 0x994008, same 32MB MMIO block as CTL0): bit0 command
++ * engine busy, bit2 command-mode MDP stream busy. Bounded by CNTPCT.
++ */
++#define EARLY_DSI_STATUS0 ((0x994008ULL - EARLY_MDP_CTL0) / 4)
++#define EARLY_DSI_BUSY   0x5u
++#define EARLY_TICKS_MS   19200ull   /* 19.2 MHz */
++
++static inline uint64_t
++early_ticks(void)
++{
++	uint64_t t;
++	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t) :: "memory");
++	return t;
++}
++
++static void
++early_wait_dsi(int want_busy, uint64_t ms)
++{
++	uint64_t end = early_ticks() + ms * EARLY_TICKS_MS;
++	while (((early_mdp[EARLY_DSI_STATUS0] & EARLY_DSI_BUSY) != 0) != want_busy &&
++	    early_ticks() < end) {
++	}
++}
++
+ static void
+ early_kick(void)
+ {
++	early_wait_dsi(0, 100);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	early_mdp[EARLY_CTL_FLUSH] = EARLY_FLUSH_VIG0;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	early_mdp[EARLY_CTL_START] = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	early_wait_dsi(1, 2);
++	early_wait_dsi(0, 100);
+ }
+ 
+ static void
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index f23ad84..75cbd75 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -739,17 +739,49 @@ fbcon_px(uint32_t x, uint32_t y, uint32_t argb)
+ 	}
+ }
+ 
++/*
++ * Optional "busy-reg" <phys size> + "busy-offset" + "busy-mask": a status
++ * register that is non-zero while a frame is on the link (OP3: DSI0
++ * STATUS0). A kick during a transfer cuts the frame short, so each kick
++ * waits for idle, starts the frame and waits until it is done.
++ */
++static volatile uint32_t *fbcon_busy_reg;
++static uint32_t fbcon_busy_mask;
++
++static inline uint64_t
++fbcon_ticks(void)
++{
++	uint64_t t;
++	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t) :: "memory");
++	return t;
++}
++
++static void
++fbcon_wait_busy(int want_busy, uint64_t ms)
++{
++	uint64_t end = fbcon_ticks() + ms * 19200;   /* 19.2 MHz */
++	while (((*fbcon_busy_reg & fbcon_busy_mask) != 0) != want_busy && fbcon_ticks() < end) {
++	}
++}
++
+ static void
+ fbcon_kick(void)
+ {
+ 	if (fbcon_kick_regs == NULL) {
+ 		return;
+ 	}
++	if (fbcon_busy_reg != NULL) {
++		fbcon_wait_busy(0, 100);
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fbcon_kick_regs[0x18 / 4] = fbcon_kick_flush;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fbcon_kick_regs[0x1c / 4] = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	if (fbcon_busy_reg != NULL) {
++		fbcon_wait_busy(1, 2);
++		fbcon_wait_busy(0, 100);
++	}
+ }
+ 
+ static void
+@@ -876,6 +908,20 @@ fbcon_probe(void)
+ 			fbcon_kick_flush = *val;
+ 		}
+ 		fbcon_kick_regs = (volatile uint32_t *)ml_io_map(kick[0], kick[1]);
++		uint64_t const *busy;
++		uint32_t const *busy_off, *busy_mask;
++		unsigned int busy_off_size, busy_mask_size;
++		if (fbcon_kick_regs != NULL &&
++		    SecureDTGetProperty(entry, "busy-reg", (void const **)&busy, &size) == kSuccess && size >= 16 &&
++		    SecureDTGetProperty(entry, "busy-offset", (void const **)&busy_off, &busy_off_size) == kSuccess &&
++		    SecureDTGetProperty(entry, "busy-mask", (void const **)&busy_mask, &busy_mask_size) == kSuccess &&
++		    *busy_off + 4 <= busy[1]) {
++			volatile uint8_t *b = (volatile uint8_t *)ml_io_map(busy[0], busy[1]);
++			if (b != NULL) {
++				fbcon_busy_mask = *busy_mask;
++				fbcon_busy_reg = (volatile uint32_t *)(b + *busy_off);
++			}
++		}
+ 	}
+ 	sweet_early_mark(17, "fbcon config read; mapping");
+ 	fbcon_base = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);

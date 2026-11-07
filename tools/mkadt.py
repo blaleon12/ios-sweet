@@ -2,7 +2,8 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--op3]
+--op3: OnePlus 3 (MSM8996) instead of the Redmi Note 10 Pro (OP3_* constants).
 """
 import hashlib, os, struct, sys
 
@@ -39,6 +40,24 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
+# ---- OnePlus 3 (MSM8996, --op3); values from the stock DTB and op3shim ----
+# RAM (LK /memory): 0x40000000+3G, 0x1_00000000+0xbd8c0000. Fixed no-map
+# carve-outs end at 0xac200000 (ramoops); the kernel's cacheable block
+# mapping must start above all of them -> 0xae000000 (32MB aligned).
+OP3_PHYS_BASE, OP3_MEM_SIZE = 0xae000000, 0x52000000   # up to 4G for bring-up
+OP3_GICD, OP3_GICD_SIZE = 0x09bc0000, 0x10000
+OP3_GICR, OP3_GICR_SIZE = 0x09c00000, 0x100000          # 4 PEs, stride 0x40000
+OP3_VTIMER_INTID = 27                                     # DT timer <1 11>
+OP3_MPIDR = (0x000, 0x001, 0x100, 0x101)                  # cpu@0/1/100/101
+OP3_CLOCK = (1593600000, 1593600000, 2150400000, 2150400000)
+# LK's VIG0 scanout buffer for the command-mode panel + the MDP CTL0 kick
+OP3_FB, OP3_FB_SIZE = 0x83400000, 0x600000
+OP3_FB_W, OP3_FB_H, OP3_FB_STRIDE, OP3_FB_DEPTH = 1080, 1920, 1080 * 3, 3
+OP3_KICK_REG, OP3_KICK_SIZE, OP3_KICK_FLUSH = 0x902000, 0x1000, 0x22041
+# DSI0 STATUS0: busy while a frame is on the link; fbcon waits on it around
+# each kick (patch 0087), a kick mid-transfer garbles the panel image
+OP3_BUSY_REG, OP3_BUSY_SIZE, OP3_BUSY_OFF, OP3_BUSY_MASK = 0x994000, 0x1000, 0x8, 0x5
+
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
@@ -74,13 +93,19 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+def build(seed=None, qemu=False, highmem=False, op3=False):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+    op3=True: OnePlus 3 (MSM8996) hardware instead of the Redmi Note 10 Pro."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    if op3:
+        phys_base, mem_size = OP3_PHYS_BASE, OP3_MEM_SIZE
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    gicd_size, gicr_size, vtimer = GICD_SIZE, GICR_SIZE, (QEMU_VTIMER_INTID if qemu else VTIMER_INTID)
+    if op3:
+        gicd, gicd_size, gicr, gicr_size, vtimer = OP3_GICD, OP3_GICD_SIZE, OP3_GICR, OP3_GICR_SIZE, OP3_VTIMER_INTID
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -134,22 +159,23 @@ def build(seed=None, qemu=False, highmem=False):
     # and uses cpus=N to select an initial prefix (N <= 8).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
+    for core in range(4 if op3 else 1 if qemu else 8):
+        mpidr = OP3_MPIDR[core] if op3 else core << 8
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('compatible', cstr('qcom,kryo') + cstr('ARM,v8') if op3 else cstr('qcom,kryo470') + cstr('ARM,v8')),
+            ('reg', u32(mpidr)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
-            ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
+            ('l2-cache-id', u32(mpidr >> 8 if op3 else core)),  # op3: one L2 per 2-core cluster
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(OP3_CLOCK[core] if op3 else 2304000000 if core >= 6 else 1804800000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -162,8 +188,8 @@ def build(seed=None, qemu=False, highmem=False):
         ph(),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
-        ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
+        ('virtual-timer-intid', u32(vtimer)),
+        ('reg', u64(gicd - SOC_BASE, gicd_size, gicr - SOC_BASE, gicr_size)),
     ])
     arm_io = node('arm-io', [
         ph(),
@@ -196,6 +222,21 @@ def build(seed=None, qemu=False, highmem=False):
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
     ])
+    if op3:
+        # command-mode panel: RGB888 + MDP CTL0 kick (fbcon, patch 0083)
+        fbcon = node('sweet-fbcon', [
+            ph(),
+            ('reg', u64(OP3_FB, OP3_FB_SIZE)),
+            ('width', u32(OP3_FB_W)),
+            ('height', u32(OP3_FB_H)),
+            ('stride', u32(OP3_FB_STRIDE)),
+            ('depth', u32(OP3_FB_DEPTH)),
+            ('kick-reg', u64(OP3_KICK_REG, OP3_KICK_SIZE)),
+            ('kick-flush', u32(OP3_KICK_FLUSH)),
+            ('busy-reg', u64(OP3_BUSY_REG, OP3_BUSY_SIZE)),
+            ('busy-offset', u32(OP3_BUSY_OFF)),
+            ('busy-mask', u32(OP3_BUSY_MASK)),
+        ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
@@ -231,18 +272,19 @@ def build(seed=None, qemu=False, highmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') +
+         (cstr('oneplus,oneplus3') + cstr('qcom,msm8996') if op3 else cstr('qcom,sm7150')) + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu or op3 else [ufs]))
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, op3='--op3' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
