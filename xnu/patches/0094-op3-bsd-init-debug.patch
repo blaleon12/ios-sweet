@@ -1,0 +1,16 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..9c00df3 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -490,7 +490,11 @@ bsd_init(void)
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#define DEBUG_BSDINIT 1   /* OP3 bring-up: show each bsd_init step (kprintf) */
++#else
+ #define DEBUG_BSDINIT 0
++#endif
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
