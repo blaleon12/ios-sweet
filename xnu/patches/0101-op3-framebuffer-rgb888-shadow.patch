@@ -1,0 +1,223 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..b2b10b6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2,6 +2,8 @@
+  * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
+  * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
+  * itself) as the main display, driven by CoreAnimation's CPU renderer.
++ * OnePlus 3: boot video depth 24 (LK's RGB888 1080x1920 buffer at
++ * 0x83400000, command-mode panel) -> 32-bit shadow + flushPanel().
+  *
+  * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
+  * device_type "display-subsystem", waits for that many services matching
+@@ -116,8 +118,20 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/*
++	 * OnePlus 3: the panel memory is RGB888 (3 bytes per pixel, bytes B,G,R)
++	 * on a command-mode panel. Userland then draws into a 32-bit shadow
++	 * (fPixels/fSurface, BGRA) and flushPanel() converts it into the panel
++	 * memory and kicks the panel (sweet_fbcon_panel_kick).
++	 */
++	bool          fShadow;
++	uintptr_t     fPanel;         /* kernel mapping of the real panel memory */
++	uint32_t      fPanelRowBytes;
++	IOMemoryDescriptor *fPanelMem;
++	IOMemoryMap  *fPanelMap;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void flushPanel(void);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -162,7 +176,22 @@ AppleCLCD::start(IOService *provider)
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
+-	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
++	fShadow = video.v_depth == 24 && fPhys != 0 && fWidth != 0 && fHeight != 0 &&
++	    fRowBytes >= fWidth * 3 && (fRowBytes % 8) == 0;
++	if (fShadow) {
++		/* RGB888 panel (OnePlus 3): map it, give userland a 32-bit shadow. */
++		fPanelRowBytes = fRowBytes;
++		fRowBytes = fWidth * 4;
++		fPanelMem = IOMemoryDescriptor::withPhysicalAddress(fPhys,
++		    round_page((uint64_t)fPanelRowBytes * fHeight), kIODirectionInOut);
++		fPanelMap = fPanelMem != NULL ? fPanelMem->createMappingInTask(kernel_task, 0,
++		    kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
++		fPanel = fPanelMap != NULL ? (uintptr_t)fPanelMap->getVirtualAddress() : 0;
++		if (fPanel == 0) {
++			IOLog("SWEET FB: cannot map the RGB888 panel at 0x%llx\n", fPhys);
++			return false;
++		}
++	} else if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+@@ -178,7 +207,9 @@ AppleCLCD::start(IOService *provider)
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+-	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++	fSurface = fShadow ?
++	    sweet_surface_create_buffer(fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA) :
++	    sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+@@ -201,11 +232,48 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
++	    fShadow ? ", RGB888 panel via 32-bit shadow" : "");
+ 	return true;
+ }
+ 
++extern "C" bool sweet_fbcon_panel_kick(void);   /* pexpert/arm/pe_serial.c */
++
++/*
++ * Shadow mode: copy the BGRA shadow into the RGB888 panel memory (bytes
++ * B,G,R: drop every 4th byte), 8 pixels = 24 bytes as three 64-bit stores,
++ * then kick the command-mode panel.
++ */
++void
++AppleCLCD::flushPanel(void)
++{
++	if (!fShadow) {
++		return;
++	}
++	for (uint32_t y = 0; y < fHeight; y++) {
++		const uint32_t *s = (const uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++		volatile uint8_t *d = (volatile uint8_t *)(fPanel + (uint64_t)y * fPanelRowBytes);
++		uint32_t x = 0;
++		for (; x + 8 <= fWidth; x += 8, s += 8, d += 24) {
++			uint64_t p0 = s[0] & 0xffffff, p1 = s[1] & 0xffffff, p2 = s[2] & 0xffffff;
++			uint64_t p3 = s[3] & 0xffffff, p4 = s[4] & 0xffffff, p5 = s[5] & 0xffffff;
++			uint64_t p6 = s[6] & 0xffffff, p7 = s[7] & 0xffffff;
++			volatile uint64_t *q = (volatile uint64_t *)d;
++			q[0] = p0 | p1 << 24 | p2 << 48;
++			q[1] = p2 >> 16 | p3 << 8 | p4 << 32 | p5 << 56;
++			q[2] = p5 >> 8 | p6 << 16 | p7 << 40;
++		}
++		for (; x < fWidth; x++, s++, d += 3) {
++			d[0] = (uint8_t)*s;
++			d[1] = (uint8_t)(*s >> 8);
++			d[2] = (uint8_t)(*s >> 16);
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	(void)sweet_fbcon_panel_kick();
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -238,6 +306,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++			fb->flushPanel();
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -255,6 +324,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		fb->flushPanel();
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..2747861 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -248,6 +248,37 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+ 	return s;
+ }
+ 
++SweetSurface *
++sweet_surface_create_buffer(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat)
++{
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
++	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	if (mem == NULL) {
++		s->release();
++		return NULL;
++	}
++	bzero(mem->getBytesNoCopy(), s->allocSize);
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	if (!sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..39d3280 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -58,6 +58,13 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/*
++ * Publish a zeroed 32-bit surface in ordinary (cached) kernel memory: the
++ * framebuffer's shadow for panels that are not 32 bpp (OnePlus 3: RGB888).
++ */
++SweetSurface *sweet_surface_create_buffer(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index b037811..bf5193a 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -784,6 +784,22 @@ fbcon_kick(void)
+ 	}
+ }
+ 
++/*
++ * For SweetFramebuffer (AppleCLCD) on command-mode panels: push the
++ * framebuffer to the panel with the same kick (and DSI busy waits) as the
++ * console. Returns false when the ADT has no kick-reg (video-mode panel).
++ */
++bool sweet_fbcon_panel_kick(void);
++bool
++sweet_fbcon_panel_kick(void)
++{
++	if (fbcon_kick_regs == NULL) {
++		return false;
++	}
++	fbcon_kick();
++	return true;
++}
++
+ static void
+ fbcon_clear_row(uint32_t row)
+ {
