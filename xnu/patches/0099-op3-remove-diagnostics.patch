@@ -1,0 +1,440 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 9c00df3..bb2a2bf 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -490,11 +490,7 @@ bsd_init(void)
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
+-#define DEBUG_BSDINIT 1   /* OP3 bring-up: show each bsd_init step (kprintf) */
+-#else
+ #define DEBUG_BSDINIT 0
+-#endif
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index d6d4b47..d74c063 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -68,12 +68,6 @@ SECURITY_READ_ONLY_LATE(static IOPlatformExpertDevice*) gRootNub;
+ 
+ #include <kern/clock.h>
+ #include <sys/time.h>
+-#if defined(__arm64__)
+-#include <pexpert/arm64/board_config.h>
+-#endif
+-#if defined(SWEET)
+-boolean_t ml_get_interrupts_enabled(void);
+-#endif
+ 
+ void
+ IOKitInitializeTime( void )
+@@ -83,9 +77,6 @@ IOKitInitializeTime( void )
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
+-#if defined(SWEET)
+-	kprintf("SWEET TIME: waiting for IORTC (30 s) IRQs=%u\n", ml_get_interrupts_enabled());
+-#endif
+ // RTC is not present on this target
+ #ifndef BCM2837
+ 	IOService::waitForService(
+@@ -96,13 +87,7 @@ IOKitInitializeTime( void )
+ 		IOService::resourceMatching("IONVRAM"), &t );
+ #endif
+ 
+-#if defined(SWEET)
+-	kprintf("SWEET TIME: IORTC wait over; clock_initialize_calendar\n");
+-#endif
+ 	clock_initialize_calendar();
+-#if defined(SWEET)
+-	kprintf("SWEET TIME: calendar initialized\n");
+-#endif
+ }
+ 
+ void
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 09c0539..4f7a8a7 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -150,12 +150,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+-		/* OP3 bring-up: sporadic hang around here, trace every step. */
+-		kprintf("SWEET CPU: cpu=%u processor_start ... IRQs=%u\n", i, ml_get_interrupts_enabled());
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+-		kprintf("SWEET CPU: cpu=%u processor_start returned %d IRQs=%u init=%u sig=%u\n", i, kr,
+-		    ml_get_interrupts_enabled(), __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+-		    (unsigned)sweet_cpu_signal_is_enabled(i));
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+@@ -163,13 +158,6 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+-			static bool once;
+-			if (!once) {
+-				once = true;
+-				kprintf("SWEET CPU: cpu=%u waiting: init=%u sig=%u IRQs=%u\n", i,
+-				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+-				    (unsigned)sweet_cpu_signal_is_enabled(i), ml_get_interrupts_enabled());
+-			}
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+ 				    i, topology->cpus[i].phys_id);
+@@ -181,13 +169,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		    i, topology->cpus[i].phys_id);
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+-	kprintf("SWEET CPU: ml_cpu_init_completed\n");
+ 	ml_cpu_init_completed();
+-	kprintf("SWEET CPU: cpusRunning\n");
+ 	__atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
+-	kprintf("SWEET CPU: publishResource\n");
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+-	kprintf("SWEET CPU: ml_set_max_cpus\n");
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index d33bace..d232347 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -500,14 +500,6 @@ cpu_idle(void)
+ 	cpu_data_t     *cpu_data_ptr = getCpuDatap();
+ 	uint64_t        new_idle_timeout_ticks = 0x0ULL, lastPop;
+ 	bool idle_disallowed = false;
+-#if defined(SWEET)
+-	{
+-		/* OP3 bring-up: count cpu_idle entries (timer state: see the heartbeat in sleh.c) */
+-		extern void sweet_fbcon_status(unsigned int, char, uint32_t);
+-		static uint32_t sweet_idle_entries;
+-		sweet_fbcon_status(1, 'I', ++sweet_idle_entries);
+-	}
+-#endif
+ 
+ 	if (__improbable((!idle_enable))) {
+ 		idle_disallowed = true;
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index a8988cf..a1f2a91 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -346,14 +346,6 @@ machine_idle(void)
+ 	 * Idle_load_context()
+ 	 */
+ 	assert((__builtin_arm_rsr("DAIF") & (DAIF_IRQF | DAIF_FIQF)) == (DAIF_IRQF | DAIF_FIQF));
+-#if defined(SWEET)
+-	{
+-		/* OP3 bring-up status: W = machine_idle entries (incl. the WFE path) */
+-		extern void sweet_fbcon_status(unsigned int, char, uint32_t);
+-		static uint32_t sweet_machine_idle;
+-		sweet_fbcon_status(2, 'W', ++sweet_machine_idle);
+-	}
+-#endif
+ 	/* Check for, and act on, a WFE recommendation.
+ 	 * Bypasses context spill/fill for a minor perf. increment.
+ 	 * May unmask and restore IRQ+FIQ mask.
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index b10d8d9..24f1abc 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1867,41 +1867,7 @@ sleh_irq(arm_saved_state_t *state)
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
+-	if (intid == 30) {
+-		/*
+-		 * OP3 bring-up heartbeat (EL1 physical timer, 100 ms, see pe_fiq.c):
+-		 * record where the CPU was and XNU's timer state, re-arm, done.
+-		 * Touches nothing of XNU's interrupt/timer machinery.
+-		 */
+-		extern void sweet_fbcon_status(unsigned int, char, uint32_t);
+-		extern void sweet_fbcon_status_kick(void);
+-		static uint32_t sweet_heartbeats;
+-		uint64_t now = mach_absolute_time();
+-		uint64_t pop = cdp->rtcPop;
+-		int64_t d = (pop == EndOfAllTime) ? INT32_MAX : (int64_t)(pop - now) / 19200;
+-		int64_t v = (int64_t)(__builtin_arm_rsr64("S3_3_C14_C3_2") -      /* CNTV_CVAL_EL0 */
+-		    __builtin_arm_rsr64("S3_3_C14_C0_2")) / 19200;                 /* CNTVCT_EL0 */
+-		sweet_fbcon_status(3, 'H', ++sweet_heartbeats);
+-		sweet_fbcon_status(4, 'D', (uint32_t)(d > INT32_MAX ? INT32_MAX : d < INT32_MIN ? INT32_MIN : d));
+-		sweet_fbcon_status(5, 'N', (uint32_t)(now / 19200000ULL));
+-		sweet_fbcon_status(6, 'E', (uint32_t)get_saved_state_pc(state));
+-		sweet_fbcon_status(7, 'L', (uint32_t)get_saved_state_lr(state));
+-		sweet_fbcon_status(8, 'C', (uint32_t)__builtin_arm_rsr64("S3_3_C14_C3_1"));   /* CNTV_CTL_EL0 */
+-		sweet_fbcon_status(9, 'V', (uint32_t)(v > INT32_MAX ? INT32_MAX : v < INT32_MIN ? INT32_MIN : v));
+-		sweet_fbcon_status(11, 'P', (uint32_t)__builtin_arm_rsr64("S3_0_C12_C12_2")); /* ICC_HPPIR1_EL1 */
+-		sweet_fbcon_status_kick();
+-		__builtin_arm_wsr64("S3_3_C14_C2_0", 1920000);   /* CNTP_TVAL_EL0: next in 100 ms */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+-		__builtin_arm_isb(ISB_SY);
+-		return;
+-	}
+ 	if (intid == sweet_vtimer_intid) {
+-		{
+-			/* OP3 bring-up status: T = vtimer IRQs */
+-			extern void sweet_fbcon_status(unsigned int, char, uint32_t);
+-			static uint32_t sweet_timer_irqs;
+-			sweet_fbcon_status(0, 'T', ++sweet_timer_irqs);
+-		}
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+@@ -1909,12 +1875,6 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_END();
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	} else if (intid < 16) {
+-		{
+-			/* OP3 bring-up status: Q = non-timer IRQs (IPIs) */
+-			extern void sweet_fbcon_status(unsigned int, char, uint32_t);
+-			static uint32_t sweet_ipis;
+-			sweet_fbcon_status(10, 'Q', ++sweet_ipis);
+-		}
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 74c06a1..55c8244 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -191,17 +191,6 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	early_kick();
+ }
+ 
+-static void
+-early_hex(const char *label, uint64_t v)
+-{
+-	sweet_early_string(label);
+-	for (int i = 60; i >= 0; i -= 4) {
+-		unsigned d = (unsigned)(v >> i) & 0xf;
+-		sweet_early_putc((char)(d < 10 ? '0' + d : 'A' + d - 10));
+-	}
+-	sweet_early_putc(' ');
+-}
+-
+ /* stage-1 EL1 read translation of va; PAR_EL1 bit0 = fault */
+ static uint64_t
+ early_at(uint64_t va)
+@@ -219,73 +208,12 @@ sweet_early_relocate(uint64_t base)
+ 	 * block at PA 0 (see sweet_early_map_final). */
+ 	uint64_t fb_va = base + (EARLY_FB_PA - EARLY_FB_BLOCK);
+ 	uint64_t mdp_va = base + 0x2000000ULL + EARLY_MDP_CTL0;
+-	/* Check both aliases while the V=P console still works (OP3 bring-up). */
+-	uint64_t par_fb = early_at(fb_va), par_mdp = early_at(mdp_va);
+-	uint64_t ttbr1, tcr;
+-	__asm__ volatile("mrs %0, ttbr1_el1\n\tmrs %1, tcr_el1" : "=r"(ttbr1), "=r"(tcr));
+-	early_hex("FBVA ", fb_va);
+-	early_hex("PAR ", par_fb);
+-	sweet_early_putc('\n');
+-	early_hex("MDPVA ", mdp_va);
+-	early_hex("PAR ", par_mdp);
+-	sweet_early_putc('\n');
+-	early_hex("TTBR1 ", ttbr1);
+-	early_hex("TCR ", tcr);
+-	sweet_early_putc('\n');
+-	if ((par_fb & 1) || (par_mdp & 1)) {
+-		/* Alias not mapped: stay on V=P (works until TTBR0 is dropped). */
++	/* A bad alias would shut the SoC down on first access (no exception);
++	 * check it while the V=P console still works and stay on V=P if so. */
++	if ((early_at(fb_va) & 1) || (early_at(mdp_va) & 1)) {
+ 		sweet_early_string("SWEET EARLY: alias FAULT, staying on V=P\n");
+ 		return;
+ 	}
+-	/*
+-	 * OP3 bring-up: on the device nothing appears after the switch even
+-	 * though AT says both aliases are mapped. Probe each access while the
+-	 * V=P console (and V=P panic output) still works; the last "ok" line
+-	 * shows which access never returns.
+-	 */
+-	/*
+-	 * 0090 on the device: the screen went BLACK (SoC shut down, not a hang)
+-	 * right after "probe 1: fb alias write". Split it up; harmless MDP
+-	 * probes first. Each line is on screen before its access runs.
+-	 */
+-	volatile uint8_t *afb = (volatile uint8_t *)(uintptr_t)fb_va;
+-	volatile uint32_t *amdp = (volatile uint32_t *)(uintptr_t)mdp_va;
+-	sweet_early_string("P1 mdp alias read ");
+-	early_kick();
+-	uint32_t st = amdp[EARLY_DSI_STATUS0];
+-	early_hex("DSI_STATUS0 ", st);
+-	sweet_early_string("ok\n");
+-	sweet_early_string("P2 mdp alias kick\n");
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	amdp[EARLY_CTL_FLUSH] = EARLY_FLUSH_VIG0;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	amdp[EARLY_CTL_START] = 1;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	early_wait_dsi(1, 2);
+-	early_wait_dsi(0, 100);
+-	sweet_early_string("P2 ok\n");
+-	/* pixel (0, 1800): below the console rows, above the bars */
+-	volatile uint32_t *aw = (volatile uint32_t *)(afb + 1800 * EARLY_STRIDE);
+-	volatile uint32_t *vw = (volatile uint32_t *)(early_fb + 1800 * EARLY_STRIDE);
+-	sweet_early_string("P3 fb alias read32 ");
+-	early_kick();
+-	uint32_t v = aw[0];
+-	early_hex("got ", v);
+-	early_hex("V=P ", vw[0]);
+-	sweet_early_string("ok\n");
+-	sweet_early_string("P4 fb alias write32\n");
+-	aw[0] = 0xffffffffu;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	early_hex("P4 ok, V=P reads ", vw[0]);
+-	sweet_early_putc('\n');
+-	sweet_early_string("P5 fb alias block write\n");
+-	for (unsigned int y = EARLY_HEIGHT - 96; y < EARLY_HEIGHT - 64; y++) {
+-		for (unsigned int x = 0; x < 96 * EARLY_BPP; x++) {
+-			afb[y * EARLY_STRIDE + x] = 0xff;   /* white block above the bars */
+-		}
+-	}
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	sweet_early_string("P5 ok, switching\n");
+ 	early_fb = (volatile uint8_t *)(uintptr_t)fb_va;
+ 	early_mdp = (volatile uint32_t *)(uintptr_t)mdp_va;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index d277355..6089db9 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -176,15 +176,6 @@ pe_init_fiq()
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+ 	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
+-	/*
+-	 * OP3 bring-up heartbeat: the EL1 physical timer (PPI 14 = INTID 30) is
+-	 * unused by XNU. Fire it every 100 ms; sleh_irq only records state and
+-	 * re-arms (sweet_heartbeat). Shows where the CPU is even when XNU's own
+-	 * timer (CNTV) is no longer programmed.
+-	 */
+-	gicr_write32(GICR_ISENABLER0, 1U << 30);
+-	__builtin_arm_wsr64("S3_3_C14_C2_0", 1920000);   /* CNTP_TVAL_EL0: 100 ms */
+-	__builtin_arm_wsr64("S3_3_C14_C2_1", 1);         /* CNTP_CTL_EL0: enable */
+ #else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 238f597..b037811 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -718,7 +718,6 @@ register_serial_functions(struct pe_serial_functions *fns)
+ extern unsigned char iso_font[256 * 16];
+ 
+ #define FBCON_SCALE     2
+-#define FBCON_STATUS_ROWS 2   /* OP3 bring-up: top rows reserved for sweet_fbcon_status */
+ #define FBCON_FG        0xffffffffu
+ #define FBCON_BG        0xff000000u
+ 
+@@ -771,10 +770,6 @@ fbcon_kick(void)
+ 	if (fbcon_kick_regs == NULL) {
+ 		return;
+ 	}
+-	/* IRQs off from "link idle" until the frame is visibly on the link, so the
+-	 * heartbeat's status kick (sweet_fbcon_status_kick) cannot slip in between
+-	 * and cut a frame; it only kicks when the link is idle. */
+-	boolean_t istate = ml_set_interrupts_enabled(FALSE);
+ 	if (fbcon_busy_reg != NULL) {
+ 		fbcon_wait_busy(0, 100);
+ 	}
+@@ -785,74 +780,10 @@ fbcon_kick(void)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	if (fbcon_busy_reg != NULL) {
+ 		fbcon_wait_busy(1, 2);
+-	}
+-	ml_set_interrupts_enabled(istate);
+-	if (fbcon_busy_reg != NULL) {
+ 		fbcon_wait_busy(0, 100);
+ 	}
+ }
+ 
+-/*
+- * OP3 bring-up status line: slot n shows "<tag>:XXXXXXXX" at the top right,
+- * drawn straight into the framebuffer (no console state, no locks), so it
+- * can be called from the timer interrupt and the idle loop. Kicks only when
+- * the link is idle and never waits.
+- */
+-void sweet_fbcon_status(unsigned int slot, char tag, uint32_t value);
+-
+-static void
+-fbcon_glyph_at(uint32_t x0, uint32_t y0, unsigned char c)
+-{
+-	const unsigned char *glyph = iso_font + c * 16;
+-	for (uint32_t gy = 0; gy < 16; gy++) {
+-		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
+-			for (uint32_t gx = 0; gx < 8; gx++) {
+-				uint32_t px = (glyph[gy] & (1u << gx)) ? 0xff00ffffu : FBCON_BG;
+-				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
+-					fbcon_px(x0 + gx * FBCON_SCALE + sx, y0 + gy * FBCON_SCALE + sy, px);
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-void
+-sweet_fbcon_status(unsigned int slot, char tag, uint32_t value)
+-{
+-	const uint32_t cw = 8 * FBCON_SCALE, ch = 16 * FBCON_SCALE, chars = 11;   /* "T:XXXXXXXX " */
+-	if (fbcon_base == NULL || fbcon_width < chars * cw) {
+-		return;
+-	}
+-	const uint32_t per_row = fbcon_width / (chars * cw);
+-	if (slot >= per_row * FBCON_STATUS_ROWS) {
+-		return;
+-	}
+-	uint32_t x = fbcon_width - (slot % per_row + 1) * chars * cw;
+-	uint32_t y = (slot / per_row) * ch;
+-	fbcon_glyph_at(x, y, (unsigned char)tag);
+-	fbcon_glyph_at(x + cw, y, ':');
+-	for (int i = 0; i < 8; i++) {
+-		unsigned d = (value >> (28 - 4 * i)) & 0xf;
+-		fbcon_glyph_at(x + (2 + i) * cw, y, (unsigned char)(d < 10 ? '0' + d : 'A' + d - 10));
+-	}
+-	/* No kick here: only the heartbeat kicks (sweet_fbcon_status_kick). */
+-}
+-
+-/* Called from the 100 ms heartbeat interrupt only: push the status area
+- * (and any console text) to the panel if the link is idle; never waits. */
+-void sweet_fbcon_status_kick(void);
+-void
+-sweet_fbcon_status_kick(void)
+-{
+-	if (fbcon_kick_regs != NULL && (fbcon_busy_reg == NULL || !(*fbcon_busy_reg & fbcon_busy_mask))) {
+-		__asm__ volatile("dsb sy" ::: "memory");
+-		fbcon_kick_regs[0x18 / 4] = fbcon_kick_flush;
+-		__asm__ volatile("dsb sy" ::: "memory");
+-		fbcon_kick_regs[0x1c / 4] = 1;
+-		__asm__ volatile("dsb sy" ::: "memory");
+-	}
+-}
+-
+ static void
+ fbcon_clear_row(uint32_t row)
+ {
+@@ -866,11 +797,10 @@ fbcon_clear_row(uint32_t row)
+ static void
+ fbcon_newline(void)
+ {
+-	/* OP3 bring-up: rows 0-1 are the status area (sweet_fbcon_status) */
+ 	fbcon_col = 0;
+-	fbcon_row = fbcon_row + 1 < fbcon_rows ? fbcon_row + 1 : FBCON_STATUS_ROWS;
++	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+ 	fbcon_clear_row(fbcon_row);
+-	fbcon_clear_row(fbcon_row + 1 < fbcon_rows ? fbcon_row + 1 : FBCON_STATUS_ROWS);
++	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
+ 	fbcon_kick();
+ }
+ 
+@@ -879,8 +809,7 @@ fbcon_init(void)
+ {
+ 	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
+ 	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
+-	fbcon_col = 0;
+-	fbcon_row = FBCON_STATUS_ROWS;
++	fbcon_col = fbcon_row = 0;
+ 	for (uint32_t r = 0; r < fbcon_rows; r++) {
+ 		fbcon_clear_row(r);
+ 	}
